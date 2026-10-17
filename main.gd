@@ -1,5 +1,5 @@
 extends Node3D
-## Volume Pool (Godot 4.2+): 36 balls (cue + 35) floating in a glass box with 12 pockets.
+## Zero-G Pool (Godot 4.2+): 36 balls (cue + 35) floating in a glass box with 12 pockets.
 ##
 ## Pockets: the 8 corners + the midpoints of the 4 long edges (the 3D version of a 6-pocket table).
 ## Rack: a 5-layer tetrahedron (15+10+6+3+1 = 35 balls). Ball 35 is the black ball, buried in the center.
@@ -11,7 +11,7 @@ extends Node3D
 ##   Ctrl+Right-drag / MMB   = orbit camera       Wheel = zoom
 ##   F = camera behind the aim line   T = aim at nearest ball (press again for the next one)
 ##   Ball pad / Arrow keys   = cue tip position (spin).  C / double-click = center
-##   R = restart.  Ball in hand: move mouse, wheel changes height, click to place.
+##   M / Esc = menu.   R = restart.  Ball in hand: move mouse, wheel changes height, click to place.
 
 # ---- volume (meters, centered on the origin)
 const W := 1.8          # x (long axis)
@@ -45,7 +45,24 @@ const DIGITS := ["111101101101111", "010110010010111", "111001111100111", "11100
 	"101101111001001", "111100111001111", "111100111101111", "111001001001001",
 	"111101111101111", "111101111001111"]
 
-enum State { PLACING, AIMING, MOVING, GAME_OVER }
+const HELP_TEXT := """GOAL
+Pot all the balls of your group, then the black ball (35). Solids are 1-17, stripes are 18-34. The first ball you pot sets your group. There are 12 pockets: the 8 corners and the middles of the 4 long edges.
+
+SHOOTING
+Hold the left mouse button and drag DOWN to pull the cue back, release to shoot (Esc cancels).
+Right-drag or A / D / W / S to aim (hold Shift for fine aim).
+T aims at the nearest ball, press again for the next one.
+Arrow keys or the ball pad choose where the cue tip hits the ball (spin). Spin curves the shot, and C re-centers it.
+
+CAMERA
+Ctrl + right-drag or middle-drag to orbit, mouse wheel to zoom, F to look along the aim line.
+
+FOULS
+A scratch, hitting no ball, or hitting the wrong group first gives your opponent ball in hand: move the mouse, use the wheel to change height, click to place.
+
+M or Esc opens this menu, R restarts the game."""
+
+enum State { MENU, PLACING, AIMING, MOVING, GAME_OVER }
 
 class Ball:
 	var pos: Vector3
@@ -175,6 +192,14 @@ var tray: Tray
 var spin_pad: SpinPad
 var spin_label: Label
 
+# ---- menu
+var menu_layer: CanvasLayer
+var menu_box: VBoxContainer
+var help_box: VBoxContainer
+var resume_btn: Button
+var game_started := false
+var state_before_menu := State.AIMING
+
 
 func _ready() -> void:
 	# 8 corners + midpoints of the 4 long (x) edges = 12 pockets
@@ -191,6 +216,7 @@ func _ready() -> void:
 	build_volume()
 	build_aim_nodes()
 	build_hud()
+	build_menu()
 	cam = Camera3D.new()
 	cam.fov = 55.0
 	cam.near = 0.02
@@ -201,7 +227,9 @@ func _ready() -> void:
 	cam_target = cue.pos
 	cam_yaw = view_yaw
 	cam_pitch = view_pitch
-	cam_dist = 0.9
+	cam_target = Vector3.ZERO
+	cam_dist = 2.8
+	open_menu()
 
 
 # ================================================================ scene building
@@ -594,6 +622,23 @@ func rotate_aim(dyaw: float, dpitch: float) -> void:
 
 # ================================================================ input
 func _unhandled_input(event: InputEvent) -> void:
+	if state == State.MENU:
+		if event is InputEventKey:
+			var mk := event as InputEventKey
+			if mk.pressed and not mk.echo:
+				match mk.keycode:
+					KEY_ENTER, KEY_KP_ENTER, KEY_SPACE:
+						if not help_box.visible:
+							if game_started:
+								_on_resume()
+							else:
+								_on_play()
+					KEY_ESCAPE:
+						if help_box.visible:
+							_on_help_back()
+						elif game_started:
+							_on_resume()
+		return
 	if event is InputEventKey:
 		var k := event as InputEventKey
 		if k.pressed and not k.echo:
@@ -607,8 +652,13 @@ func _unhandled_input(event: InputEvent) -> void:
 					if state == State.AIMING:
 						target_nearest(true)
 				KEY_ESCAPE:
-					charging = false
-					power = 0.0
+					if charging:
+						charging = false
+						power = 0.0
+					else:
+						open_menu()
+				KEY_M:
+					open_menu()
 				KEY_SPACE, KEY_ENTER:
 					if state == State.PLACING:
 						confirm_placement()
@@ -826,7 +876,7 @@ func end_shot() -> void:
 	if potted_this_shot.has(BLACK):
 		winner = cur if (shooter_on_black and not foul) else other
 		state = State.GAME_OVER
-		message = "Press R to play again."
+		message = "Press R to play again, or M for the menu."
 		return
 
 	if groups[cur] == -1 and not foul:
@@ -867,6 +917,8 @@ func end_shot() -> void:
 
 # ================================================================ per-frame
 func _process(delta: float) -> void:
+	if state == State.MENU:
+		view_yaw += delta * 0.12   # slow cinematic orbit behind the menu
 	if state == State.AIMING:
 		var slow := 0.25 if Input.is_key_pressed(KEY_SHIFT) else 1.0
 		var yaw := 0.0
@@ -996,6 +1048,7 @@ func aim_trace(origin: Vector3, dir: Vector3) -> Dictionary:
 	return {"t": best, "ball": hit}
 
 func update_hud() -> void:
+	hud.visible = state != State.MENU
 	var grp := "open table"
 	if groups[player] == 0: grp = "solids 1-17"
 	elif groups[player] == 1: grp = "stripes 18-34"
@@ -1011,3 +1064,115 @@ func update_hud() -> void:
 	spin_pad.offset = spin
 	spin_pad.queue_redraw()
 	tray.queue_redraw()
+
+
+# ================================================================ menu
+func menu_label(text: String, size: int, color: Color, parent: Control) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.add_theme_font_size_override("font_size", size)
+	l.add_theme_color_override("font_color", color)
+	l.add_theme_color_override("font_outline_color", Color.BLACK)
+	l.add_theme_constant_override("outline_size", 10)
+	parent.add_child(l)
+	return l
+
+func menu_button(text: String, parent: Control, cb: Callable) -> Button:
+	var b := Button.new()
+	b.text = text
+	b.custom_minimum_size = Vector2(320, 54)
+	b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	b.focus_mode = Control.FOCUS_NONE
+	b.add_theme_font_size_override("font_size", 24)
+	b.pressed.connect(cb)
+	parent.add_child(b)
+	return b
+
+func build_menu() -> void:
+	menu_layer = CanvasLayer.new()
+	menu_layer.layer = 10
+	add_child(menu_layer)
+
+	var dim := ColorRect.new()
+	dim.color = Color(0.02, 0.03, 0.07, 0.5)
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_layer.add_child(dim)
+
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_layer.add_child(center)
+
+	# main menu
+	menu_box = VBoxContainer.new()
+	menu_box.add_theme_constant_override("separation", 14)
+	center.add_child(menu_box)
+	menu_label("ZERO-G POOL", 84, Color(0.75, 0.92, 1.0), menu_box)
+	menu_label("36 balls  -  12 pockets  -  no gravity", 20, Color(1, 0.95, 0.65), menu_box)
+	var gap := Control.new()
+	gap.custom_minimum_size = Vector2(0, 28)
+	menu_box.add_child(gap)
+	menu_button("Play", menu_box, _on_play)
+	resume_btn = menu_button("Resume game", menu_box, _on_resume)
+	resume_btn.visible = false
+	menu_button("How to play", menu_box, _on_help)
+	menu_button("Quit", menu_box, _on_quit)
+
+	# how-to-play page
+	help_box = VBoxContainer.new()
+	help_box.add_theme_constant_override("separation", 16)
+	help_box.visible = false
+	center.add_child(help_box)
+	menu_label("HOW TO PLAY", 48, Color(0.75, 0.92, 1.0), help_box)
+	var panel := PanelContainer.new()
+	help_box.add_child(panel)
+	var margin := MarginContainer.new()
+	var sides: Array[String] = ["left", "right", "top", "bottom"]
+	for side in sides:
+		margin.add_theme_constant_override("margin_" + side, 22)
+	panel.add_child(margin)
+	var txt := Label.new()
+	txt.text = HELP_TEXT
+	txt.custom_minimum_size = Vector2(860, 0)
+	txt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	txt.add_theme_font_size_override("font_size", 17)
+	margin.add_child(txt)
+	menu_button("Back", help_box, _on_help_back)
+
+func open_menu() -> void:
+	if state == State.MENU: return
+	state_before_menu = state
+	state = State.MENU
+	charging = false
+	power = 0.0
+	zoom = 1.0
+	view_pitch = 0.3
+	resume_btn.visible = game_started
+	menu_box.visible = true
+	help_box.visible = false
+	menu_layer.visible = true
+
+func _on_play() -> void:
+	if game_started:
+		new_game()
+	game_started = true
+	menu_layer.visible = false
+	state = State.AIMING
+	snap_view()
+
+func _on_resume() -> void:
+	menu_layer.visible = false
+	state = state_before_menu
+	if state == State.AIMING:
+		snap_view()
+
+func _on_help() -> void:
+	menu_box.visible = false
+	help_box.visible = true
+
+func _on_help_back() -> void:
+	help_box.visible = false
+	menu_box.visible = true
+
+func _on_quit() -> void:
+	get_tree().quit()
