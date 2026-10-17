@@ -1,33 +1,45 @@
 extends Node3D
-## 3D 8-ball pool for Godot 4.2+ with cue-ball spin.
-## Physics runs on the table plane (x, z); every ball tracks linear velocity plus spin,
-## so follow, draw, stun and side english (cushion throw) all emerge from sliding/rolling friction.
+## Volume Pool (Godot 4.2+): 36 balls (cue + 35) floating in a glass box with 12 pockets.
+##
+## Pockets: the 8 corners + the midpoints of the 4 long edges (the 3D version of a 6-pocket table).
+## Rack: a 5-layer tetrahedron (15+10+6+3+1 = 35 balls). Ball 35 is the black ball, buried in the center.
+## Groups: solids 1-17, stripes 18-34, black 35.
 ##
 ## Controls
 ##   Hold LMB and drag DOWN  = pull the cue back (power). Release = shoot. Esc = cancel.
-##   Right-drag / A,D        = aim   (Shift = fine)       Wheel = zoom
-##   Click the ball pad, or Arrow keys = choose where the cue hits the ball (C / double-click = center)
-##   R = restart
+##   Right-drag / A,D,W,S    = aim (relative to the screen; Shift = fine)
+##   Ctrl+Right-drag / MMB   = orbit camera       Wheel = zoom
+##   F = camera behind the aim line   T = aim at nearest ball (press again for the next one)
+##   Ball pad / Arrow keys   = cue tip position (spin).  C / double-click = center
+##   R = restart.  Ball in hand: move mouse, wheel changes height, click to place.
 
-# ---- table (meters, table centered on the origin, felt surface at y = 0)
-const TW := 2.54
-const TH := 1.27
-const TABLE := Rect2(-TW / 2.0, -TH / 2.0, TW, TH)
+# ---- volume (meters, centered on the origin)
+const W := 1.8          # x (long axis)
+const H := 0.9          # y (up)
+const D := 0.9          # z
+const HALF := Vector3(W / 2.0, H / 2.0, D / 2.0)
 const R := 0.0286
-const POCKET_R := 0.068
-const SUBSTEPS := 10
+const LO := Vector3(-W / 2.0 + R, -H / 2.0 + R, -D / 2.0 + R)   # ball-center limits
+const HI := Vector3(W / 2.0 - R, H / 2.0 - R, D / 2.0 - R)
+const POCKET_R := 0.12
+const POCKET_PULL := 0.8        # gentle suction near pockets (0 = off). 3D pockets are hard to hit.
+const PULL_RANGE := 0.26
+const BLACK := 35
+
+# ---- physics
+const SUBSTEPS := 8
 const MAX_SPEED := 6.0
-const FRICTION := 0.5            # rolling deceleration (m/s^2)
-const DAMPING := 0.25
-const SLIDE_FRICTION := 2.0      # cloth sliding friction (mu * g)
-const SLIP_EPS := 0.003
-const CUSHION_BOUNCE := 0.78
-const CUSHION_FRICTION := 0.35   # how strongly a rail grips a spinning ball
-const SIDE_DECAY := 0.6
+const DRAG := 1.4               # the "air": exponential slowdown (1/s)
+const FRICTION := 0.1           # constant slowdown (m/s^2) so balls come to rest
+const SPIN_DECAY := 1.0
+const MAGNUS := 0.0025          # spin curves the ball: a = MAGNUS * (spin x velocity)
+const WALL_BOUNCE := 0.85
+const WALL_FRICTION := 0.3      # walls grip spin
 const BALL_BOUNCE := 0.96
+const BALL_FRICTION := 0.08     # ball-to-ball throw
 const STOP_SPEED := 0.02
-const DRAG_RANGE := 260.0        # pixels of mouse drag for full power
-const MAX_TIP_OFFSET := 0.5      # max cue-tip offset from ball center, as a fraction of R
+const DRAG_RANGE := 260.0       # px of mouse drag for full power
+const MAX_TIP_OFFSET := 0.5     # fraction of R
 
 const DIGITS := ["111101101101111", "010110010010111", "111001111100111", "111001111001111",
 	"101101111001001", "111100111001111", "111100111101111", "111001001001001",
@@ -36,29 +48,29 @@ const DIGITS := ["111101101101111", "010110010010111", "111001111100111", "11100
 enum State { PLACING, AIMING, MOVING, GAME_OVER }
 
 class Ball:
-	var pos: Vector2
-	var vel := Vector2.ZERO
-	var w := Vector2.ZERO     # horizontal angular velocity (x, z axes)
-	var ws := 0.0             # vertical-axis spin (side english), + = counterclockwise from above
+	var pos: Vector3
+	var vel := Vector3.ZERO
+	var w := Vector3.ZERO     # angular velocity
 	var num: int
+	var idx := 0
 	var potted := false
 	var node: MeshInstance3D
 	var tween: Tween
-	func _init(n: int, p: Vector2) -> void:
+	func _init(n: int, p: Vector3) -> void:
 		num = n
 		pos = p
 
-## Small HUD control that draws the potted balls.
+## HUD control that draws the potted balls.
 class Tray extends Control:
 	var nums: Array[int] = []
 	var colors: Array = []
 	func _draw() -> void:
 		for i in nums.size():
-			_ball(Vector2(14 + i * 28, 16), nums[i], 11.0)
+			_ball(Vector2(12 + i * 26, 14), nums[i], 10.0)
 	func _ball(p: Vector2, num: int, rad: float) -> void:
 		var cream := Color(0.96, 0.96, 0.92)
-		var col: Color = colors[num if num <= 8 else num - 8]
-		if num <= 8:
+		var col: Color = colors[num]
+		if num < 18 or num == 35:
 			draw_circle(p, rad, col)
 		else:
 			draw_circle(p, rad, cream)
@@ -71,11 +83,11 @@ class Tray extends Control:
 				var ang := lerpf(PI - a, PI + a, k / 8.0)
 				pts.append(p + Vector2(cos(ang), sin(ang)) * rad)
 			draw_colored_polygon(pts, col)
-		draw_circle(p, rad * 0.5, cream)
-		draw_string(ThemeDB.fallback_font, p + Vector2(-rad, rad * 0.32), str(num),
-			HORIZONTAL_ALIGNMENT_CENTER, rad * 2.0, int(rad * 0.9), Color.BLACK)
+		draw_circle(p, rad * 0.55, cream)
+		draw_string(ThemeDB.fallback_font, p + Vector2(-rad, rad * 0.3), str(num),
+			HORIZONTAL_ALIGNMENT_CENTER, rad * 2.0, int(rad * 0.8), Color.BLACK)
 
-## Cue-ball face: click / drag to choose the strike point. x = right, y = top (follow).
+## Cue-ball face: click / drag to choose the strike point. x = right, y = top.
 class SpinPad extends Control:
 	signal changed(v: Vector2)
 	var offset := Vector2.ZERO
@@ -110,27 +122,20 @@ class SpinPad extends Control:
 		draw_circle(dot, 7.0, Color(0.85, 0.1, 0.1))
 		draw_arc(dot, 7.0, 0.0, TAU, 20, Color.WHITE, 1.5)
 
-var ball_colors := [
-	Color(0.96, 0.96, 0.92),
-	Color(0.95, 0.77, 0.0),   # 1 yellow
-	Color(0.1, 0.3, 0.8),     # 2 blue
-	Color(0.85, 0.12, 0.1),   # 3 red
-	Color(0.4, 0.15, 0.6),    # 4 purple
-	Color(0.95, 0.5, 0.05),   # 5 orange
-	Color(0.05, 0.5, 0.2),    # 6 green
-	Color(0.5, 0.08, 0.1),    # 7 maroon
-	Color(0.04, 0.04, 0.04),  # 8 black
-]
+var ball_colors: Array[Color] = []
 
 # ---- game state
 var balls: Array[Ball] = []
 var cue: Ball
-var pockets := PackedVector2Array()
+var pockets := PackedVector3Array()
 var state := State.AIMING
 var power := 0.0
-var spin := Vector2.ZERO      # strike point on the cue ball: x right, y top, each -1..1
+var spin := Vector2.ZERO
 var charging := false
 var drag_start := Vector2.ZERO
+var aim_dir := Vector3.RIGHT
+var target_idx := 0
+var place_y := 0.0
 var player := 0
 var groups := [-1, -1]        # -1 open, 0 solids, 1 stripes
 var message := ""
@@ -139,16 +144,16 @@ var first_hit := -1
 var potted_this_shot: Array[int] = []
 var potted_tray: Array[int] = []
 var cue_potted := false
-var shooter_on_eight := false
+var shooter_on_black := false
 
 # ---- camera
 var cam: Camera3D
-var aim_yaw := -PI / 2.0
-var aim_pitch := deg_to_rad(22.0)
-var aim_dist := 1.0
+var view_yaw := -PI / 2.0
+var view_pitch := 0.38
+var zoom := 1.0
 var cam_target := Vector3.ZERO
 var cam_yaw := -PI / 2.0
-var cam_pitch := deg_to_rad(22.0)
+var cam_pitch := 0.38
 var cam_dist := 1.0
 
 # ---- visuals / hud
@@ -156,9 +161,11 @@ var aim_root: Node3D
 var aim_line: MeshInstance3D
 var target_line: MeshInstance3D
 var ghost: MeshInstance3D
+var target_hl: MeshInstance3D
 var stick: MeshInstance3D
 var spin_dot: MeshInstance3D
 var invalid_marker: MeshInstance3D
+var drop_line: MeshInstance3D
 var hud: CanvasLayer
 var status_label: Label
 var msg_label: Label
@@ -170,13 +177,18 @@ var spin_label: Label
 
 
 func _ready() -> void:
-	var hx := TW / 2.0
-	var hz := TH / 2.0
-	pockets = PackedVector2Array([
-		Vector2(-hx, -hz), Vector2(0, -hz - 0.015), Vector2(hx, -hz),
-		Vector2(-hx, hz), Vector2(0, hz + 0.015), Vector2(hx, hz)])
+	# 8 corners + midpoints of the 4 long (x) edges = 12 pockets
+	var sx: Array[float] = [-1.0, 1.0]
+	for x in sx:
+		for y in sx:
+			for z in sx:
+				pockets.append(Vector3(x * HALF.x, y * HALF.y, z * HALF.z))
+	for y in sx:
+		for z in sx:
+			pockets.append(Vector3(0.0, y * HALF.y, z * HALF.z))
+	build_palette()
 	build_environment()
-	build_table()
+	build_volume()
 	build_aim_nodes()
 	build_hud()
 	cam = Camera3D.new()
@@ -186,7 +198,10 @@ func _ready() -> void:
 	add_child(cam)
 	cam.make_current()
 	new_game()
-	cam_target = Vector3(cue.pos.x, R, cue.pos.y)
+	cam_target = cue.pos
+	cam_yaw = view_yaw
+	cam_pitch = view_pitch
+	cam_dist = 0.9
 
 
 # ================================================================ scene building
@@ -204,110 +219,139 @@ func unshaded(c: Color) -> StandardMaterial3D:
 		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	return m
 
-func add_box(size: Vector3, pos: Vector3, m: Material) -> void:
+func no_shadow(mi: GeometryInstance3D) -> void:
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+
+func add_box(size: Vector3, pos: Vector3, m: Material, shadow := true) -> MeshInstance3D:
 	var bm := BoxMesh.new()
 	bm.size = size
 	bm.material = m
 	var mi := MeshInstance3D.new()
 	mi.mesh = bm
 	mi.position = pos
+	if not shadow:
+		no_shadow(mi)
 	add_child(mi)
+	return mi
+
+func add_sphere(radius: float, pos: Vector3, m: Material, shadow := true) -> MeshInstance3D:
+	var sm := SphereMesh.new()
+	sm.radius = radius
+	sm.height = 2.0 * radius
+	sm.material = m
+	var mi := MeshInstance3D.new()
+	mi.mesh = sm
+	mi.position = pos
+	if not shadow:
+		no_shadow(mi)
+	add_child(mi)
+	return mi
+
+func build_palette() -> void:
+	ball_colors.clear()
+	ball_colors.append(Color(0.96, 0.96, 0.92))   # 0 = cue ball
+	var base: Array[Color] = []
+	for i in 17:
+		var h := fmod(i * 0.381966, 1.0)
+		var s := 0.9 if i % 2 == 0 else 0.6
+		var v := 0.95 if i % 3 != 0 else 0.75
+		base.append(Color.from_hsv(h, s, v))
+	for n in range(1, 35):
+		ball_colors.append(base[(n - 1) % 17])    # solids 1-17 and stripes 18-34 share the palette
+	ball_colors.append(Color(0.04, 0.04, 0.04))   # 35 = black
 
 func build_environment() -> void:
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.05, 0.05, 0.07)
+	env.background_color = Color(0.04, 0.045, 0.06)
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.7, 0.72, 0.8)
-	env.ambient_light_energy = 0.5
+	env.ambient_light_color = Color(0.75, 0.78, 0.9)
+	env.ambient_light_energy = 0.6
 	env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
 
 	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-60, 30, 0)
-	sun.light_energy = 0.3
+	sun.rotation_degrees = Vector3(-55, 35, 0)
+	sun.light_energy = 0.5
 	add_child(sun)
 
 	var lamp := SpotLight3D.new()
-	lamp.position = Vector3(0, 2.2, 0)
+	lamp.position = Vector3(0, 2.6, 0)
 	lamp.rotation_degrees = Vector3(-90, 0, 0)
-	lamp.spot_range = 5.0
-	lamp.spot_angle = 55.0
+	lamp.spot_range = 6.0
+	lamp.spot_angle = 50.0
 	lamp.light_energy = 3.0
 	lamp.shadow_enabled = true
 	add_child(lamp)
 
-	var floor_mesh := PlaneMesh.new()
-	floor_mesh.size = Vector2(14, 14)
-	floor_mesh.material = mat(Color(0.12, 0.12, 0.15), 0.9)
-	var fl := MeshInstance3D.new()
-	fl.mesh = floor_mesh
-	fl.position = Vector3(0, -0.94, 0)
-	add_child(fl)
+	var ground := PlaneMesh.new()
+	ground.size = Vector2(16, 16)
+	ground.material = mat(Color(0.1, 0.1, 0.13), 0.9)
+	var gi := MeshInstance3D.new()
+	gi.mesh = ground
+	gi.position = Vector3(0, -1.3, 0)
+	add_child(gi)
 
-func build_table() -> void:
-	var felt := mat(Color(0.05, 0.42, 0.22), 0.95)
-	var cush := mat(Color(0.04, 0.33, 0.17), 0.9)
-	var wood := mat(Color(0.33, 0.17, 0.07), 0.4)
-	var cw := 0.06   # cushion width
-	var rw := 0.14   # wooden rail width
-	var cg := 0.07   # gap at corner pockets
-	var sg := 0.06   # half gap at side pockets
-	var hx := TW / 2.0
-	var hz := TH / 2.0
+func build_volume() -> void:
+	# floor (felt) so ball shadows give a sense of depth
+	add_box(Vector3(W + 0.04, 0.02, D + 0.04), Vector3(0, -HALF.y - 0.011, 0), mat(Color(0.05, 0.4, 0.22), 0.95))
+	# pedestal
+	add_box(Vector3(W * 0.5, 0.35, D * 0.5), Vector3(0, -HALF.y - 0.2, 0), mat(Color(0.2, 0.1, 0.05), 0.5))
 
-	add_box(Vector3(TW, 0.04, TH), Vector3(0, -0.02, 0), felt)
-	add_box(Vector3(TW + 2.0 * (cw + rw), 0.1, TH + 2.0 * (cw + rw)), Vector3(0, -0.09, 0), wood)
+	# glass walls
+	var gm := mat(Color(0.7, 0.85, 1.0, 0.06))
+	gm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	gm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	gm.cull_mode = BaseMaterial3D.CULL_DISABLED
+	add_box(Vector3(W, H, D), Vector3.ZERO, gm, false)
 
-	var signs: Array[float] = [-1.0, 1.0]
-	var seg_len := hx - cg - sg
-	var seg_mid := (sg + hx - cg) / 2.0
-	for sz in signs:
-		for sx in signs:
-			add_box(Vector3(seg_len, 0.08, cw), Vector3(sx * seg_mid, 0.0, sz * (hz + cw / 2.0)), cush)
-			add_box(Vector3(seg_len, 0.09, rw), Vector3(sx * seg_mid, 0.005, sz * (hz + cw + rw / 2.0)), wood)
-	for sx in signs:
-		add_box(Vector3(cw, 0.08, TH - 2.0 * cg), Vector3(sx * (hx + cw / 2.0), 0.0, 0.0), cush)
-		add_box(Vector3(rw, 0.09, TH - 2.0 * cg), Vector3(sx * (hx + cw + rw / 2.0), 0.005, 0.0), wood)
-		for sz in signs:
-			add_box(Vector3(0.14, 0.8, 0.14), Vector3(sx * (hx + cw + rw - 0.1), -0.54, sz * (hz + cw + rw - 0.1)), wood)
+	# 12 frame edges
+	var frame := mat(Color(0.62, 0.5, 0.22), 0.35)
+	frame.metallic = 0.7
+	var t := 0.024
+	var sg: Array[float] = [-1.0, 1.0]
+	for a in sg:
+		for b in sg:
+			add_box(Vector3(W + t, t, t), Vector3(0, a * HALF.y, b * HALF.z), frame)
+			add_box(Vector3(t, H + t, t), Vector3(a * HALF.x, 0, b * HALF.z), frame)
+			add_box(Vector3(t, t, D + t), Vector3(a * HALF.x, b * HALF.y, 0), frame)
 
-	var hole := CylinderMesh.new()
-	hole.top_radius = POCKET_R
-	hole.bottom_radius = POCKET_R
-	hole.height = 0.004
-	hole.material = mat(Color(0.01, 0.01, 0.01), 1.0)
+	# 12 pockets: dark cups plus a faint halo that shows the capture zone
+	var cup := mat(Color(0.02, 0.02, 0.02), 0.3)
+	var halo := unshaded(Color(0.6, 0.85, 1.0, 0.07))
 	for pk in pockets:
-		var mi := MeshInstance3D.new()
-		mi.mesh = hole
-		mi.position = Vector3(pk.x, 0.002, pk.y)
-		add_child(mi)
+		add_sphere(POCKET_R - R, pk, cup)
+		add_sphere(POCKET_R, pk, halo, false)
 
 func make_line() -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
 	var bm := BoxMesh.new()
 	bm.material = unshaded(Color.WHITE)
 	mi.mesh = bm
-	aim_root.add_child(mi)
+	no_shadow(mi)
 	return mi
 
 func build_aim_nodes() -> void:
 	aim_root = Node3D.new()
 	add_child(aim_root)
 	aim_line = make_line()
-	(aim_line.mesh as BoxMesh).material = unshaded(Color(1, 1, 1, 0.55))
+	(aim_line.mesh as BoxMesh).material = unshaded(Color(1, 1, 1, 0.6))
+	aim_root.add_child(aim_line)
 	target_line = make_line()
-	(target_line.mesh as BoxMesh).material = unshaded(Color(1, 0.9, 0.3, 0.85))
+	(target_line.mesh as BoxMesh).material = unshaded(Color(1, 0.9, 0.3, 0.9))
+	aim_root.add_child(target_line)
 
-	var gm := SphereMesh.new()
-	gm.radius = R
-	gm.height = 2.0 * R
-	gm.material = unshaded(Color(1, 1, 1, 0.3))
-	ghost = MeshInstance3D.new()
-	ghost.mesh = gm
+	ghost = add_sphere(R, Vector3.ZERO, unshaded(Color(1, 1, 1, 0.3)), false)
+	remove_child(ghost)
 	aim_root.add_child(ghost)
+	target_hl = add_sphere(R * 1.3, Vector3.ZERO, unshaded(Color(1, 0.9, 0.2, 0.25)), false)
+	remove_child(target_hl)
+	aim_root.add_child(target_hl)
+	spin_dot = add_sphere(0.004, Vector3.ZERO, unshaded(Color(0.95, 0.1, 0.1)), false)
+	remove_child(spin_dot)
+	aim_root.add_child(spin_dot)
 
 	var cm := CylinderMesh.new()
 	cm.top_radius = 0.014
@@ -316,25 +360,15 @@ func build_aim_nodes() -> void:
 	cm.material = mat(Color(0.8, 0.6, 0.32), 0.4)
 	stick = MeshInstance3D.new()
 	stick.mesh = cm
+	no_shadow(stick)
 	aim_root.add_child(stick)
 
-	var dm := SphereMesh.new()
-	dm.radius = 0.004
-	dm.height = 0.008
-	dm.material = unshaded(Color(0.95, 0.1, 0.1))
-	spin_dot = MeshInstance3D.new()
-	spin_dot.mesh = dm
-	aim_root.add_child(spin_dot)
-
-	var im := CylinderMesh.new()
-	im.top_radius = R * 1.5
-	im.bottom_radius = R * 1.5
-	im.height = 0.002
-	im.material = unshaded(Color(1, 0.15, 0.15, 0.6))
-	invalid_marker = MeshInstance3D.new()
-	invalid_marker.mesh = im
+	invalid_marker = add_sphere(R * 1.3, Vector3.ZERO, unshaded(Color(1, 0.15, 0.15, 0.45)), false)
 	invalid_marker.visible = false
-	add_child(invalid_marker)
+	drop_line = make_line()
+	(drop_line.mesh as BoxMesh).material = unshaded(Color(1, 1, 1, 0.5))
+	drop_line.visible = false
+	add_child(drop_line)
 
 func make_label(text_size: int, pos: Vector2, width := 0.0) -> Label:
 	var l := Label.new()
@@ -368,13 +402,13 @@ func build_hud() -> void:
 	over_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	over_label.visible = false
 	tray = Tray.new()
-	tray.position = Vector2(24, 652)
+	tray.position = Vector2(24, 622)
 	tray.colors = ball_colors
 	tray.nums = potted_tray
 	hud.add_child(tray)
 
 	spin_label = make_label(14, Vector2(1112, 528))
-	spin_label.text = "Cue ball spin (C = center)"
+	spin_label.text = "Cue tip (C = center)"
 	spin_pad = SpinPad.new()
 	spin_pad.position = Vector2(1140, 556)
 	spin_pad.custom_minimum_size = Vector2(112, 112)
@@ -382,8 +416,8 @@ func build_hud() -> void:
 	spin_pad.changed.connect(_on_spin_changed)
 	hud.add_child(spin_pad)
 
-	var hint := make_label(13, Vector2(24, 692))
-	hint.text = "Hold LMB + drag down: power, release to shoot (Esc cancels)   Right-drag / A,D: aim   Arrows / ball pad: spin   Wheel: zoom   R: restart"
+	var hint := make_label(13, Vector2(24, 662), 1080.0)
+	hint.text = "LMB hold + drag down: power, release to shoot (Esc cancels)   Right-drag / A,D,W,S: aim   Ctrl+Right-drag / MMB: orbit   Wheel: zoom   F: view behind aim   T: target nearest ball   Arrows / pad: spin   R: restart"
 	hint.modulate = Color(1, 1, 1, 0.65)
 
 func _on_spin_changed(v: Vector2) -> void:
@@ -419,8 +453,8 @@ func make_ball_texture(num: int) -> ImageTexture:
 		spot(img, 128, 128, 7, Color(0.8, 0.1, 0.1))
 		spot(img, 384, 128, 7, Color(0.8, 0.1, 0.1))
 	else:
-		var col: Color = ball_colors[num if num <= 8 else num - 8]
-		if num <= 8:
+		var col := ball_colors[num]
+		if num < 18 or num == BLACK:
 			img.fill(col)
 		else:
 			img.fill(white)
@@ -432,13 +466,13 @@ func make_ball_texture(num: int) -> ImageTexture:
 	img.generate_mipmaps()
 	return ImageTexture.create_from_image(img)
 
-func make_ball(num: int, p: Vector2) -> Ball:
+func add_ball(num: int, p: Vector3) -> Ball:
 	var b := Ball.new(num, p)
 	var sm := SphereMesh.new()
 	sm.radius = R
 	sm.height = 2.0 * R
-	sm.radial_segments = 48
-	sm.rings = 24
+	sm.radial_segments = 40
+	sm.rings = 20
 	var m := StandardMaterial3D.new()
 	m.albedo_texture = make_ball_texture(num)
 	m.roughness = 0.15
@@ -446,10 +480,12 @@ func make_ball(num: int, p: Vector2) -> Ball:
 	sm.material = m
 	var mi := MeshInstance3D.new()
 	mi.mesh = sm
-	mi.position = Vector3(p.x, R, p.y)
+	mi.position = p
 	mi.basis = Basis.from_euler(Vector3(randf() * TAU, randf() * TAU, randf() * TAU))
 	add_child(mi)
 	b.node = mi
+	b.idx = balls.size()
+	balls.append(b)
 	return b
 
 
@@ -467,29 +503,39 @@ func new_game() -> void:
 	power = 0.0
 	spin = Vector2.ZERO
 	charging = false
-	aim_yaw = -PI / 2.0
-	cue = make_ball(0, Vector2(-TW * 0.25, 0.0))
-	balls.append(cue)
+	zoom = 1.0
+	cue = add_ball(0, Vector3(-W * 0.3, 0.0, 0.0))
 
-	var nums: Array = [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]
+	# 35-ball tetrahedron: layer L (0..4) is a triangle with L+1 balls per side.
+	# The apex (1 ball) faces the cue ball; the 15-ball base is at the back.
+	var nums: Array = range(1, 35)
 	nums.shuffle()
-	nums.insert(4, 8)  # 8-ball in the middle of the rack
-	var foot := Vector2(TW * 0.25, 0.0)
+	var sp := 2.0 * R + 0.0004
+	var dx := sqrt(2.0 / 3.0) * sp
+	var apex_x := W * 0.14
 	var i := 0
-	for col in 5:
-		for row in col + 1:
-			var p := foot + Vector2(col * (R * 2.0 * 0.8660254 + 0.0004), (row - col / 2.0) * (R * 2.0 + 0.0004))
-			balls.append(make_ball(nums[i], p))
-			i += 1
+	for layer in 5:
+		var n := layer + 1
+		for row in n:
+			for col in n - row:
+				var lz := col * sp + row * sp * 0.5 - (n - 1) * sp * 0.5
+				var ly := row * sp * 0.8660254 - (n - 1) * sp * 0.8660254 / 3.0
+				var p := Vector3(apex_x + layer * dx, ly, lz)
+				if layer == 3 and row == 1 and col == 1:
+					add_ball(BLACK, p)       # the single interior ball = center of the rack
+				else:
+					add_ball(nums[i], p)
+					i += 1
 	state = State.AIMING
 	message = "Player 1 breaks. Hold LMB and drag down to pull the cue back, release to shoot."
+	target_nearest(false)
 
 
 # ================================================================ helpers
 func group_of(n: int) -> int:
 	if n == 0: return -1
-	if n == 8: return 2
-	return 0 if n < 8 else 1
+	if n == BLACK: return 2
+	return 0 if n <= 17 else 1
 
 func remaining(g: int) -> int:
 	var c := 0
@@ -500,12 +546,13 @@ func remaining(g: int) -> int:
 
 func any_moving() -> bool:
 	for b in balls:
-		if not b.potted and b.vel != Vector2.ZERO:
+		if not b.potted and b.vel != Vector3.ZERO:
 			return true
 	return false
 
-func placement_valid(p: Vector2) -> bool:
-	if not TABLE.grow(-R).has_point(p): return false
+func placement_valid(p: Vector3) -> bool:
+	if p.x < LO.x or p.y < LO.y or p.z < LO.z or p.x > HI.x or p.y > HI.y or p.z > HI.z:
+		return false
 	for pk in pockets:
 		if p.distance_to(pk) < POCKET_R + R: return false
 	for b in balls:
@@ -513,11 +560,36 @@ func placement_valid(p: Vector2) -> bool:
 			return false
 	return true
 
-func aim_dir() -> Vector2:
-	return Vector2(-sin(aim_yaw), -cos(aim_yaw))
+## Basis whose x = shooter's right, y = shooter's up, z = backwards (-aim).
+func shot_basis(d: Vector3) -> Basis:
+	var ref := Vector3.UP if absf(d.y) < 0.99 else Vector3.RIGHT
+	var right := d.cross(ref).normalized()
+	var up := right.cross(d).normalized()
+	return Basis(right, up, -d)
 
-func to3(p: Vector2) -> Vector3:
-	return Vector3(p.x, R, p.y)
+func snap_view() -> void:
+	var o := (-aim_dir + Vector3.UP * 0.4).normalized()
+	view_yaw = atan2(o.x, o.z)
+	view_pitch = asin(clampf(o.y, -0.99, 0.99))
+
+func target_nearest(next: bool) -> void:
+	var cands: Array[Ball] = []
+	for b in balls:
+		if b != cue and not b.potted:
+			cands.append(b)
+	if cands.is_empty(): return
+	cands.sort_custom(func(x: Ball, y: Ball) -> bool:
+		return x.pos.distance_squared_to(cue.pos) < y.pos.distance_squared_to(cue.pos))
+	if next:
+		target_idx = (target_idx + 1) % cands.size()
+	else:
+		target_idx = 0
+	aim_dir = (cands[target_idx].pos - cue.pos).normalized()
+	snap_view()
+
+func rotate_aim(dyaw: float, dpitch: float) -> void:
+	var cb := cam.global_transform.basis
+	aim_dir = aim_dir.rotated(cb.y.normalized(), dyaw).rotated(cb.x.normalized(), dpitch).normalized()
 
 
 # ================================================================ input
@@ -528,6 +600,12 @@ func _unhandled_input(event: InputEvent) -> void:
 			match k.keycode:
 				KEY_R: new_game()
 				KEY_C: spin = Vector2.ZERO
+				KEY_F:
+					if state == State.AIMING:
+						snap_view()
+				KEY_T:
+					if state == State.AIMING:
+						target_nearest(true)
 				KEY_ESCAPE:
 					charging = false
 					power = 0.0
@@ -552,41 +630,53 @@ func _unhandled_input(event: InputEvent) -> void:
 					else:
 						power = 0.0
 			MOUSE_BUTTON_WHEEL_UP:
-				if mb.pressed: aim_dist = clampf(aim_dist * 0.92, 0.4, 3.0)
+				if mb.pressed:
+					if state == State.PLACING:
+						place_y = clampf(place_y + 0.03, LO.y, HI.y)
+					else:
+						zoom = clampf(zoom * 0.92, 0.35, 2.5)
 			MOUSE_BUTTON_WHEEL_DOWN:
-				if mb.pressed: aim_dist = clampf(aim_dist / 0.92, 0.4, 3.0)
+				if mb.pressed:
+					if state == State.PLACING:
+						place_y = clampf(place_y - 0.03, LO.y, HI.y)
+					else:
+						zoom = clampf(zoom / 0.92, 0.35, 2.5)
 	elif event is InputEventMouseMotion:
 		var mm := event as InputEventMouseMotion
 		if charging:
 			power = clampf((mm.position.y - drag_start.y) / DRAG_RANGE, 0.0, 1.0)
-		if state == State.AIMING and (mm.button_mask & MOUSE_BUTTON_MASK_RIGHT) != 0:
+		var right_down := (mm.button_mask & MOUSE_BUTTON_MASK_RIGHT) != 0
+		var orbit := (mm.button_mask & MOUSE_BUTTON_MASK_MIDDLE) != 0 or (right_down and Input.is_key_pressed(KEY_CTRL))
+		if orbit:
+			view_yaw -= mm.relative.x * 0.005
+			view_pitch = clampf(view_pitch + mm.relative.y * 0.005, -1.45, 1.45)
+		elif right_down and state == State.AIMING:
 			var s := 0.2 if Input.is_key_pressed(KEY_SHIFT) else 1.0
-			aim_yaw -= mm.relative.x * 0.003 * s
-			aim_pitch = clampf(aim_pitch + mm.relative.y * 0.003, deg_to_rad(8.0), deg_to_rad(85.0))
+			rotate_aim(-mm.relative.x * 0.003 * s, -mm.relative.y * 0.003 * s)
 
 func confirm_placement() -> void:
 	if placement_valid(cue.pos):
 		state = State.AIMING
 		power = 0.0
 		message = "Player %d: aim and shoot." % (player + 1)
+		target_nearest(false)
 
 func shoot() -> void:
-	var d := aim_dir()
+	var d := aim_dir
 	var v0 := power * MAX_SPEED
-	var a_side := spin.x * MAX_TIP_OFFSET   # fraction of R, + = right of center
-	var a_top := spin.y * MAX_TIP_OFFSET    # fraction of R, + = above center (follow)
+	var sb := shot_basis(d)
+	var a := spin.x * MAX_TIP_OFFSET   # + = right of center
+	var b := spin.y * MAX_TIP_OFFSET   # + = above center
 	cue.vel = d * v0
-	# Angular impulse from an off-center hit: omega = 2.5 * v0 * offset / R.
-	# a_top = 0.4 gives pure rolling, less is draw/stun, more is follow.
-	cue.w = Vector2(d.y, -d.x) * (2.5 * v0 * a_top / R)
-	cue.ws = 2.5 * v0 * a_side / R
+	# off-center hit: omega = 2.5 * v0 / R * (a * up - b * right)
+	cue.w = (sb.y * a - sb.x * b) * (2.5 * v0 / R)
 	first_hit = -1
 	potted_this_shot.clear()
 	cue_potted = false
-	shooter_on_eight = groups[player] != -1 and remaining(groups[player]) == 0
+	shooter_on_black = groups[player] != -1 and remaining(groups[player]) == 0
 	state = State.MOVING
 	message = ""
-	spin = Vector2.ZERO   # spin resets to center after every shot
+	spin = Vector2.ZERO
 
 
 # ================================================================ physics
@@ -598,47 +688,40 @@ func _physics_process(delta: float) -> void:
 	if not any_moving():
 		end_shot()
 
-func cushion(b: Ball, n: Vector2) -> void:
-	# n = inward normal of the rail. The rail grips side spin and converts it into sideways throw.
+func wall_bounce(b: Ball, n: Vector3) -> void:
+	# n = inward normal of the wall. The wall grips the ball's spin (english, follow, draw).
 	var vn := b.vel.dot(n)
 	if vn >= 0.0: return
-	var tau := Vector2(-n.y, n.x)
-	var vt := b.vel.dot(tau)
-	var s := vt + R * b.ws
-	var jmax := CUSHION_FRICTION * (1.0 + CUSHION_BOUNCE) * -vn
-	var jt := clampf(-s / 3.5, -jmax, jmax)
-	b.vel = n * (-CUSHION_BOUNCE * vn) + tau * (vt + jt)
-	b.ws += (2.5 / R) * jt
+	var vt := b.vel - n * vn
+	var s := vt - R * b.w.cross(n)
+	var jmax := WALL_FRICTION * (1.0 + WALL_BOUNCE) * -vn
+	var jt := -s / 3.5
+	if jt.length() > jmax:
+		jt = jt.normalized() * jmax
+	b.vel = n * (-WALL_BOUNCE * vn) + vt + jt
+	b.w += n.cross(jt) * (-2.5 / R)
 
 func step(dt: float) -> void:
-	var minp := TABLE.position + Vector2(R, R)
-	var maxp := TABLE.end - Vector2(R, R)
 	for b in balls:
 		if b.potted: continue
+		if b.vel == Vector3.ZERO: continue
+		# spin curves the ball (Magnus effect)
+		b.vel += MAGNUS * b.w.cross(b.vel) * dt
+		# soft pull into nearby pockets
+		for pk in pockets:
+			var to := pk - b.pos
+			var dist := to.length()
+			if dist < PULL_RANGE and dist > 0.0001:
+				b.vel += to / dist * POCKET_PULL * (1.0 - dist / PULL_RANGE) * dt
 		b.pos += b.vel * dt
-
-		# Cloth friction. u = velocity of the contact point relative to the cloth.
-		var u := b.vel + R * Vector2(b.w.y, -b.w.x)
-		var ul := u.length()
-		if ul > SLIP_EPS:
-			# sliding: friction changes both velocity and spin until slip reaches zero
-			var uh := u / ul
-			var kf := minf(SLIDE_FRICTION * dt, ul / 3.5)
-			b.vel -= uh * kf
-			b.w += (2.5 / R) * Vector2(uh.y, -uh.x) * kf
+		var sp := b.vel.length()
+		var ns := maxf(0.0, sp - FRICTION * dt) * (1.0 - DRAG * dt)
+		if ns < STOP_SPEED:
+			b.vel = Vector3.ZERO
+			b.w = Vector3.ZERO
 		else:
-			# rolling
-			var sp := b.vel.length()
-			if sp > 0.0:
-				var ns := maxf(0.0, sp - FRICTION * dt) * (1.0 - DAMPING * dt)
-				b.vel = b.vel / sp * ns
-			if b.vel.length() < STOP_SPEED:
-				b.vel = Vector2.ZERO
-				b.w = Vector2.ZERO
-				b.ws = 0.0
-			else:
-				b.w = Vector2(b.vel.y, -b.vel.x) / R
-		b.ws *= (1.0 - SIDE_DECAY * dt)
+			b.vel = b.vel / sp * ns
+			b.w *= (1.0 - SPIN_DECAY * dt)
 
 		for pk in pockets:
 			if b.pos.distance_to(pk) < POCKET_R:
@@ -646,45 +729,62 @@ func step(dt: float) -> void:
 				break
 		if b.potted: continue
 
-		if b.pos.x < minp.x:
-			b.pos.x = minp.x
-			cushion(b, Vector2(1, 0))
-		elif b.pos.x > maxp.x:
-			b.pos.x = maxp.x
-			cushion(b, Vector2(-1, 0))
-		if b.pos.y < minp.y:
-			b.pos.y = minp.y
-			cushion(b, Vector2(0, 1))
-		elif b.pos.y > maxp.y:
-			b.pos.y = maxp.y
-			cushion(b, Vector2(0, -1))
+		var p := b.pos
+		for ax in 3:
+			var n := Vector3.ZERO
+			if p[ax] < LO[ax]:
+				p[ax] = LO[ax]
+				n[ax] = 1.0
+				b.pos = p
+				wall_bounce(b, n)
+			elif p[ax] > HI[ax]:
+				p[ax] = HI[ax]
+				n[ax] = -1.0
+				b.pos = p
+				wall_bounce(b, n)
 
-	for i in balls.size():
-		var a := balls[i]
-		if a.potted: continue
-		for j in range(i + 1, balls.size()):
-			var c := balls[j]
-			if c.potted: continue
+	# ball-ball collisions (only pairs involving at least one moving ball)
+	var moving: Array[Ball] = []
+	for b in balls:
+		if not b.potted and b.vel != Vector3.ZERO:
+			moving.append(b)
+	for a in moving:
+		for c in balls:
+			if c == a or c.potted: continue
+			if c.idx < a.idx and c.vel != Vector3.ZERO: continue
 			var d := c.pos - a.pos
-			var dist := d.length()
-			if dist < 2.0 * R and dist > 0.00001:
-				var n := d / dist
-				var overlap := 2.0 * R - dist
-				a.pos -= n * overlap * 0.5
-				c.pos += n * overlap * 0.5
-				var rel := (a.vel - c.vel).dot(n)
-				if rel > 0.0:
-					var imp := rel * (1.0 + BALL_BOUNCE) * 0.5
-					a.vel -= n * imp
-					c.vel += n * imp
-					if first_hit < 0 and (a == cue or c == cue):
-						first_hit = c.num if a == cue else a.num
+			var d2 := d.length_squared()
+			if d2 >= 4.0 * R * R or d2 < 1e-10: continue
+			var dist := sqrt(d2)
+			var n := d / dist
+			var overlap := 2.0 * R - dist
+			a.pos -= n * overlap * 0.5
+			c.pos += n * overlap * 0.5
+			var rel_v := a.vel - c.vel
+			var rel := rel_v.dot(n)
+			if rel > 0.0:
+				var imp := rel * (1.0 + BALL_BOUNCE) * 0.5
+				a.vel -= n * imp
+				c.vel += n * imp
+				# contact friction: throw and spin transfer
+				var vt := rel_v - n * rel
+				var s := vt + R * (a.w + c.w).cross(n)
+				var f := -s / 7.0
+				var fmax := BALL_FRICTION * imp
+				if f.length() > fmax:
+					f = f.normalized() * fmax
+				a.vel += f
+				c.vel -= f
+				var dw := n.cross(f) * (2.5 / R)
+				a.w += dw
+				c.w += dw
+				if first_hit < 0 and (a == cue or c == cue):
+					first_hit = c.num if a == cue else a.num
 
-func pot(b: Ball, pk: Vector2) -> void:
+func pot(b: Ball, pk: Vector3) -> void:
 	b.potted = true
-	b.vel = Vector2.ZERO
-	b.w = Vector2.ZERO
-	b.ws = 0.0
+	b.vel = Vector3.ZERO
+	b.w = Vector3.ZERO
 	if b == cue:
 		cue_potted = true
 	else:
@@ -693,7 +793,7 @@ func pot(b: Ball, pk: Vector2) -> void:
 	if b.tween:
 		b.tween.kill()
 	b.tween = create_tween()
-	b.tween.tween_property(b.node, "position", Vector3(pk.x, -0.1, pk.y), 0.3)
+	b.tween.tween_property(b.node, "position", pk, 0.3)
 	b.tween.tween_callback(b.node.hide)
 
 
@@ -711,20 +811,20 @@ func end_shot() -> void:
 	elif first_hit < 0:
 		foul = true
 		reason = "no ball hit"
-	elif shooter_on_eight:
-		if first_hit != 8:
+	elif shooter_on_black:
+		if first_hit != BLACK:
 			foul = true
-			reason = "must hit the 8-ball first"
+			reason = "must hit the black ball first"
 	elif groups[cur] != -1:
 		if group_of(first_hit) != groups[cur]:
 			foul = true
 			reason = "wrong ball hit first"
-	elif first_hit == 8:
+	elif first_hit == BLACK:
 		foul = true
-		reason = "hit the 8-ball first"
+		reason = "hit the black ball first"
 
-	if potted_this_shot.has(8):
-		winner = cur if (shooter_on_eight and not foul) else other
+	if potted_this_shot.has(BLACK):
+		winner = cur if (shooter_on_black and not foul) else other
 		state = State.GAME_OVER
 		message = "Press R to play again."
 		return
@@ -743,32 +843,40 @@ func end_shot() -> void:
 	if foul:
 		player = other
 		state = State.PLACING
+		place_y = clampf(cue.pos.y, LO.y, HI.y)
+		view_yaw = 0.0
+		view_pitch = 0.45
 		if cue.potted:
 			cue.potted = false
 			if cue.tween:
 				cue.tween.kill()
 			cue.node.show()
-		cue.vel = Vector2.ZERO
-		cue.w = Vector2.ZERO
-		cue.ws = 0.0
-		message = "Foul (%s). Player %d has ball in hand: move the cue ball and click to place it." % [reason, player + 1]
-	elif potted_own:
-		state = State.AIMING
-		message = "Nice shot! Player %d shoots again." % (player + 1)
+			place_y = 0.0
+		cue.vel = Vector3.ZERO
+		cue.w = Vector3.ZERO
+		message = "Foul (%s). Player %d has ball in hand: move the mouse, wheel = height, click to place." % [reason, player + 1]
 	else:
-		player = other
+		if potted_own:
+			message = "Nice shot! Player %d shoots again." % (player + 1)
+		else:
+			player = other
+			message = "Player %d's turn." % (player + 1)
 		state = State.AIMING
-		message = "Player %d's turn." % (player + 1)
+		target_nearest(false)
 
 
 # ================================================================ per-frame
 func _process(delta: float) -> void:
 	if state == State.AIMING:
 		var slow := 0.25 if Input.is_key_pressed(KEY_SHIFT) else 1.0
-		if Input.is_key_pressed(KEY_A):
-			aim_yaw += delta * slow
-		if Input.is_key_pressed(KEY_D):
-			aim_yaw -= delta * slow
+		var yaw := 0.0
+		var pitch := 0.0
+		if Input.is_key_pressed(KEY_A): yaw += 1.0
+		if Input.is_key_pressed(KEY_D): yaw -= 1.0
+		if Input.is_key_pressed(KEY_W): pitch += 1.0
+		if Input.is_key_pressed(KEY_S): pitch -= 1.0
+		if yaw != 0.0 or pitch != 0.0:
+			rotate_aim(yaw * delta * slow, pitch * delta * slow)
 		var sv := Vector2.ZERO
 		if Input.is_key_pressed(KEY_UP): sv.y += 1.0
 		if Input.is_key_pressed(KEY_DOWN): sv.y -= 1.0
@@ -781,10 +889,10 @@ func _process(delta: float) -> void:
 		var mp := get_viewport().get_mouse_position()
 		var o := cam.project_ray_origin(mp)
 		var n := cam.project_ray_normal(mp)
-		if n.y < -0.001:
-			var hit := o + n * ((R - o.y) / n.y)
-			var inner := TABLE.grow(-R)
-			cue.pos = Vector2(hit.x, hit.z).clamp(inner.position, inner.end)
+		if absf(n.y) > 0.05:
+			var t := (place_y - o.y) / n.y
+			if t > 0.0:
+				cue.pos = (o + n * t).clamp(LO, HI)
 
 	sync_balls(delta)
 	update_camera(delta)
@@ -794,31 +902,25 @@ func _process(delta: float) -> void:
 func sync_balls(delta: float) -> void:
 	for b in balls:
 		if b.potted: continue
-		b.node.position = to3(b.pos)
-		var om := Vector3(b.w.x, b.ws, b.w.y)
-		var ang := om.length() * delta
+		b.node.position = b.pos
+		var ang := b.w.length() * delta
 		if ang > 1e-6:
-			b.node.basis = (Basis(om.normalized(), ang) * b.node.basis).orthonormalized()
+			b.node.basis = (Basis(b.w.normalized(), ang) * b.node.basis).orthonormalized()
 
 func update_camera(delta: float) -> void:
 	var d_target := Vector3.ZERO
-	var d_dist := 2.6
-	var d_pitch := deg_to_rad(52.0)
-	var d_yaw := aim_yaw
+	var d_dist := 2.8 * zoom
 	match state:
 		State.AIMING:
-			d_target = to3(cue.pos)
-			d_dist = aim_dist
-			d_pitch = aim_pitch
+			d_target = cue.pos
+			d_dist = 0.9 * zoom
 		State.PLACING:
-			d_dist = 2.4
-			d_pitch = deg_to_rad(85.0)
-			d_yaw = 0.0
+			d_dist = 2.6 * zoom
 	var k := 1.0 - exp(-8.0 * delta)
 	cam_target = cam_target.lerp(d_target, k)
 	cam_dist = lerpf(cam_dist, d_dist, k)
-	cam_pitch = lerpf(cam_pitch, d_pitch, k)
-	cam_yaw = lerp_angle(cam_yaw, d_yaw, k)
+	cam_pitch = lerpf(cam_pitch, view_pitch, k)
+	cam_yaw = lerp_angle(cam_yaw, view_yaw, k)
 	var off := Vector3(sin(cam_yaw) * cos(cam_pitch), sin(cam_pitch), cos(cam_yaw) * cos(cam_pitch)) * cam_dist
 	cam.position = cam_target + off
 	cam.look_at(cam_target, Vector3.UP)
@@ -828,46 +930,47 @@ func place_line(node: MeshInstance3D, a: Vector3, b: Vector3, w: float) -> void:
 	var l := d.length()
 	node.visible = l > 0.002
 	if l <= 0.002: return
+	var dn := d / l
+	var ref := Vector3.UP if absf(dn.y) < 0.99 else Vector3.RIGHT
 	(node.mesh as BoxMesh).size = Vector3(w, w, l)
-	node.global_transform = Transform3D(Basis.looking_at(d / l, Vector3.UP), (a + b) * 0.5)
+	node.global_transform = Transform3D(Basis.looking_at(dn, ref), (a + b) * 0.5)
 
 func update_aim() -> void:
 	aim_root.visible = state == State.AIMING
 	invalid_marker.visible = state == State.PLACING and not placement_valid(cue.pos)
-	invalid_marker.position = Vector3(cue.pos.x, 0.004, cue.pos.y)
+	invalid_marker.position = cue.pos
+	drop_line.visible = state == State.PLACING
+	if state == State.PLACING:
+		place_line(drop_line, cue.pos, Vector3(cue.pos.x, -HALF.y, cue.pos.z), 0.003)
 	if state != State.AIMING: return
 
-	var dir := aim_dir()
-	var info := aim_trace(cue.pos, dir)
+	var d := aim_dir
+	var info := aim_trace(cue.pos, d)
 	var t: float = info["t"]
 	var hit: Ball = info["ball"]
-	var end := cue.pos + dir * t
-	place_line(aim_line, to3(cue.pos), to3(end), 0.004)
-	ghost.position = to3(end)
+	var end := cue.pos + d * t
+	place_line(aim_line, cue.pos, end, 0.004)
+	ghost.position = end
+	target_hl.visible = hit != null
 	if hit != null:
+		target_hl.position = hit.pos
 		var n := (hit.pos - end).normalized()
-		place_line(target_line, to3(hit.pos), to3(hit.pos + n * 0.3), 0.004)
+		place_line(target_line, hit.pos, hit.pos + n * 0.3, 0.004)
 	else:
 		target_line.visible = false
 
-	# strike point on the cue ball (red dot) and cue stick aimed at it
-	var f3 := Vector3(dir.x, 0.0, dir.y)
-	var r3 := Vector3(-dir.y, 0.0, dir.x)       # shooter's right
+	# strike point on the cue ball (red dot) and the cue stick aimed at it
+	var sb := shot_basis(d)
 	var a := spin.x * MAX_TIP_OFFSET
-	var bb := spin.y * MAX_TIP_OFFSET
-	var fwd := sqrt(maxf(0.0, 1.0 - a * a - bb * bb))
-	var strike := to3(cue.pos) + (-f3 * fwd + r3 * a + Vector3.UP * bb) * R
+	var b := spin.y * MAX_TIP_OFFSET
+	var fwd := sqrt(maxf(0.0, 1.0 - a * a - b * b))
+	var strike := cue.pos + (-d * fwd + sb.x * a + sb.y * b) * R
 	spin_dot.position = strike
-
-	var tilt := deg_to_rad(4.0)
-	var axis := -f3 * cos(tilt) + Vector3.UP * sin(tilt)   # from tip toward butt
 	var pull := 0.01 + power * 0.30
-	var tip := strike - f3 * pull
-	stick.global_transform = Transform3D(
-		Basis.looking_at(-axis, Vector3.UP) * Basis(Vector3.RIGHT, PI / 2.0),
-		tip + axis * 0.7)
+	var tip := strike - d * pull
+	stick.global_transform = Transform3D(Basis(sb.x, -d, -sb.y), tip - d * 0.7)
 
-func aim_trace(origin: Vector2, dir: Vector2) -> Dictionary:
+func aim_trace(origin: Vector3, dir: Vector3) -> Dictionary:
 	var best := INF
 	var hit: Ball = null
 	for b in balls:
@@ -881,12 +984,12 @@ func aim_trace(origin: Vector2, dir: Vector2) -> Dictionary:
 		if t > 0.0 and t < best:
 			best = t
 			hit = b
-	var inner := TABLE.grow(-R)
 	var tr := INF
-	if dir.x > 0.0: tr = minf(tr, (inner.end.x - origin.x) / dir.x)
-	elif dir.x < 0.0: tr = minf(tr, (inner.position.x - origin.x) / dir.x)
-	if dir.y > 0.0: tr = minf(tr, (inner.end.y - origin.y) / dir.y)
-	elif dir.y < 0.0: tr = minf(tr, (inner.position.y - origin.y) / dir.y)
+	for ax in 3:
+		if dir[ax] > 1e-6:
+			tr = minf(tr, (HI[ax] - origin[ax]) / dir[ax])
+		elif dir[ax] < -1e-6:
+			tr = minf(tr, (LO[ax] - origin[ax]) / dir[ax])
 	if tr < best:
 		best = tr
 		hit = null
@@ -894,9 +997,9 @@ func aim_trace(origin: Vector2, dir: Vector2) -> Dictionary:
 
 func update_hud() -> void:
 	var grp := "open table"
-	if groups[player] == 0: grp = "solids"
-	elif groups[player] == 1: grp = "stripes"
-	if groups[player] != -1 and remaining(groups[player]) == 0: grp = "8-ball"
+	if groups[player] == 0: grp = "solids 1-17"
+	elif groups[player] == 1: grp = "stripes 18-34"
+	if groups[player] != -1 and remaining(groups[player]) == 0: grp = "black ball"
 	status_label.text = "Player %d  (%s)" % [player + 1, grp]
 	msg_label.text = message
 	power_bar.value = power
