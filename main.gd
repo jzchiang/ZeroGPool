@@ -8,10 +8,11 @@ extends Node3D
 ## Controls
 ##   Hold LMB and drag DOWN  = pull the cue back (power). Release = shoot. Esc = cancel.
 ##   Right-drag / A,D,W,S    = aim (relative to the screen; Shift = fine)
-##   Ctrl+Right-drag / MMB   = orbit camera       Wheel = zoom
+##   Ctrl+Right-drag / MMB   = orbit (free trackball, no fixed up)   Q/E = roll   Wheel = zoom
+##   1-6 or click the orientation cube = view from +X -X +Y -Y +Z -Z   L = level the horizon
 ##   F = camera behind the aim line   T = aim at nearest ball (press again for the next one)
 ##   Ball pad / Arrow keys   = cue tip position (spin).  C / double-click = center
-##   M / Esc = menu.   R = restart.  Ball in hand: move mouse, wheel changes height, click to place.
+##   M / Esc = menu.   R = restart.  Ball in hand: move mouse, wheel changes depth, click to place.
 
 # ---- volume (meters, centered on the origin)
 const W := 1.8          # x (long axis)
@@ -54,11 +55,13 @@ Right-drag or A / D / W / S to aim (hold Shift for fine aim).
 T aims at the nearest ball, press again for the next one.
 Arrow keys or the ball pad choose where the cue tip hits the ball (spin). Spin curves the shot, and C re-centers it.
 
-CAMERA
-Ctrl + right-drag or middle-drag to orbit, mouse wheel to zoom, F to look along the aim line.
+CAMERA (a free trackball: there is no fixed "up")
+Ctrl + right-drag or middle-drag to orbit over any pole, Q / E to roll, mouse wheel to zoom.
+Keys 1-6, or a click on the orientation cube, snap to the +X, -X, +Y, -Y, +Z and -Z views. The box edges are colored by axis: X red, Y green, Z blue.
+F looks along the aim line, L levels the horizon.
 
 FOULS
-A scratch, hitting no ball, or hitting the wrong group first gives your opponent ball in hand: move the mouse, use the wheel to change height, click to place.
+A scratch, hitting no ball, or hitting the wrong group first gives your opponent ball in hand: move the mouse, use the wheel to change depth, click to place.
 
 M or Esc opens this menu, R restarts the game."""
 
@@ -152,7 +155,7 @@ var charging := false
 var drag_start := Vector2.ZERO
 var aim_dir := Vector3.RIGHT
 var target_idx := 0
-var place_y := 0.0
+var place_depth := 2.6      # ball-in-hand: distance from the camera along its view axis
 var player := 0
 var groups := [-1, -1]        # -1 open, 0 solids, 1 stripes
 var message := ""
@@ -163,14 +166,12 @@ var potted_tray: Array[int] = []
 var cue_potted := false
 var shooter_on_black := false
 
-# ---- camera
+# ---- camera: a free trackball. Orientation is a quaternion, so there is no fixed "up".
 var cam: Camera3D
-var view_yaw := -PI / 2.0
-var view_pitch := 0.38
+var view_q := Quaternion(Basis(Vector3.UP, -PI / 2.0))   # desired orientation
+var cam_q := Quaternion(Basis(Vector3.UP, -PI / 2.0))    # smoothed orientation actually shown
 var zoom := 1.0
 var cam_target := Vector3.ZERO
-var cam_yaw := -PI / 2.0
-var cam_pitch := 0.38
 var cam_dist := 1.0
 
 # ---- visuals / hud
@@ -182,7 +183,10 @@ var target_hl: MeshInstance3D
 var stick: MeshInstance3D
 var spin_dot: MeshInstance3D
 var invalid_marker: MeshInstance3D
-var drop_line: MeshInstance3D
+var guides_cue: Array[MeshInstance3D] = []
+var guides_ghost: Array[MeshInstance3D] = []
+var gizmo_box: SubViewportContainer
+var gizmo_cam: Camera3D
 var hud: CanvasLayer
 var status_label: Label
 var msg_label: Label
@@ -216,6 +220,7 @@ func _ready() -> void:
 	build_volume()
 	build_aim_nodes()
 	build_hud()
+	build_gizmo()
 	build_menu()
 	cam = Camera3D.new()
 	cam.fov = 55.0
@@ -223,10 +228,17 @@ func _ready() -> void:
 	cam.far = 60.0
 	add_child(cam)
 	cam.make_current()
+	# lights ride on the camera, so the lighting never says which way is "down"
+	var key := DirectionalLight3D.new()
+	key.rotation_degrees = Vector3(-25, -25, 0)
+	key.light_energy = 1.0
+	cam.add_child(key)
+	var fill := DirectionalLight3D.new()
+	fill.rotation_degrees = Vector3(20, 140, 0)
+	fill.light_energy = 0.35
+	cam.add_child(fill)
 	new_game()
-	cam_target = cue.pos
-	cam_yaw = view_yaw
-	cam_pitch = view_pitch
+	cam_q = view_q
 	cam_target = Vector3.ZERO
 	cam_dist = 2.8
 	open_menu()
@@ -291,66 +303,49 @@ func build_palette() -> void:
 func build_environment() -> void:
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.04, 0.045, 0.06)
+	env.background_color = Color(0.03, 0.035, 0.05)
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.75, 0.78, 0.9)
-	env.ambient_light_energy = 0.6
+	env.ambient_light_color = Color(0.8, 0.82, 0.95)
+	env.ambient_light_energy = 0.55
 	env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
 
-	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-55, 35, 0)
-	sun.light_energy = 0.5
-	add_child(sun)
-
-	var lamp := SpotLight3D.new()
-	lamp.position = Vector3(0, 2.6, 0)
-	lamp.rotation_degrees = Vector3(-90, 0, 0)
-	lamp.spot_range = 6.0
-	lamp.spot_angle = 50.0
-	lamp.light_energy = 3.0
-	lamp.shadow_enabled = true
-	add_child(lamp)
-
-	var ground := PlaneMesh.new()
-	ground.size = Vector2(16, 16)
-	ground.material = mat(Color(0.1, 0.1, 0.13), 0.9)
-	var gi := MeshInstance3D.new()
-	gi.mesh = ground
-	gi.position = Vector3(0, -1.3, 0)
-	add_child(gi)
-
 func build_volume() -> void:
-	# floor (felt) so ball shadows give a sense of depth
-	add_box(Vector3(W + 0.04, 0.02, D + 0.04), Vector3(0, -HALF.y - 0.011, 0), mat(Color(0.05, 0.4, 0.22), 0.95))
-	# pedestal
-	add_box(Vector3(W * 0.5, 0.35, D * 0.5), Vector3(0, -HALF.y - 0.2, 0), mat(Color(0.2, 0.1, 0.05), 0.5))
-
-	# glass walls
-	var gm := mat(Color(0.7, 0.85, 1.0, 0.06))
+	# Six identical glass faces carrying a faint grid (aligned to world space, 15 cm cells).
+	var img := Image.create(64, 64, true, Image.FORMAT_RGBA8)
+	img.fill(Color(0.6, 0.8, 1.0, 0.035))
+	img.fill_rect(Rect2i(0, 0, 64, 2), Color(0.65, 0.85, 1.0, 0.30))
+	img.fill_rect(Rect2i(0, 0, 2, 64), Color(0.65, 0.85, 1.0, 0.30))
+	img.generate_mipmaps()
+	var gm := StandardMaterial3D.new()
 	gm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	gm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	gm.cull_mode = BaseMaterial3D.CULL_DISABLED
+	gm.albedo_texture = ImageTexture.create_from_image(img)
+	gm.uv1_triplanar = true
+	gm.uv1_world_triplanar = true
+	gm.uv1_scale = Vector3.ONE / 0.15
 	add_box(Vector3(W, H, D), Vector3.ZERO, gm, false)
 
-	# 12 frame edges
-	var frame := mat(Color(0.62, 0.5, 0.22), 0.35)
-	frame.metallic = 0.7
+	# 12 frame edges, colored by axis: X red, Y green, Z blue
+	var cx := unshaded(Color(0.95, 0.3, 0.3))
+	var cy := unshaded(Color(0.35, 0.9, 0.4))
+	var cz := unshaded(Color(0.35, 0.55, 1.0))
 	var t := 0.024
 	var sg: Array[float] = [-1.0, 1.0]
 	for a in sg:
 		for b in sg:
-			add_box(Vector3(W + t, t, t), Vector3(0, a * HALF.y, b * HALF.z), frame)
-			add_box(Vector3(t, H + t, t), Vector3(a * HALF.x, 0, b * HALF.z), frame)
-			add_box(Vector3(t, t, D + t), Vector3(a * HALF.x, b * HALF.y, 0), frame)
+			add_box(Vector3(W + t, t, t), Vector3(0, a * HALF.y, b * HALF.z), cx, false)
+			add_box(Vector3(t, H + t, t), Vector3(a * HALF.x, 0, b * HALF.z), cy, false)
+			add_box(Vector3(t, t, D + t), Vector3(a * HALF.x, b * HALF.y, 0), cz, false)
 
 	# 12 pockets: dark cups plus a faint halo that shows the capture zone
 	var cup := mat(Color(0.02, 0.02, 0.02), 0.3)
 	var halo := unshaded(Color(0.6, 0.85, 1.0, 0.07))
 	for pk in pockets:
-		add_sphere(POCKET_R - R, pk, cup)
+		add_sphere(POCKET_R - R, pk, cup, false)
 		add_sphere(POCKET_R, pk, halo, false)
 
 func make_line() -> MeshInstance3D:
@@ -393,10 +388,30 @@ func build_aim_nodes() -> void:
 
 	invalid_marker = add_sphere(R * 1.3, Vector3.ZERO, unshaded(Color(1, 0.15, 0.15, 0.45)), false)
 	invalid_marker.visible = false
-	drop_line = make_line()
-	(drop_line.mesh as BoxMesh).material = unshaded(Color(1, 1, 1, 0.5))
-	drop_line.visible = false
-	add_child(drop_line)
+
+	# depth guides: thin axis-colored lines from a ball to the nearest wall on each axis
+	guides_cue = make_guides()
+	guides_ghost = make_guides()
+
+func make_guides() -> Array[MeshInstance3D]:
+	var out: Array[MeshInstance3D] = []
+	var cols: Array[Color] = [Color(0.95, 0.3, 0.3, 0.55), Color(0.35, 0.9, 0.4, 0.55), Color(0.35, 0.55, 1.0, 0.55)]
+	for i in 3:
+		var ln := make_line()
+		(ln.mesh as BoxMesh).material = unshaded(cols[i])
+		ln.visible = false
+		add_child(ln)
+		out.append(ln)
+	return out
+
+func update_guides(lines: Array[MeshInstance3D], p: Vector3, show_them: bool) -> void:
+	for i in 3:
+		lines[i].visible = false
+	if not show_them: return
+	for ax in 3:
+		var wall := p
+		wall[ax] = HALF[ax] if p[ax] >= 0.0 else -HALF[ax]
+		place_line(lines[ax], p, wall, 0.0025)
 
 func make_label(text_size: int, pos: Vector2, width := 0.0) -> Label:
 	var l := Label.new()
@@ -445,7 +460,7 @@ func build_hud() -> void:
 	hud.add_child(spin_pad)
 
 	var hint := make_label(13, Vector2(24, 662), 1080.0)
-	hint.text = "LMB hold + drag down: power, release to shoot (Esc cancels)   Right-drag / A,D,W,S: aim   Ctrl+Right-drag / MMB: orbit   Wheel: zoom   F: view behind aim   T: target nearest ball   Arrows / pad: spin   R: restart"
+	hint.text = "LMB hold + drag down: power, release to shoot (Esc cancels)   Right-drag / A,D,W,S: aim   Ctrl+Right-drag / MMB: orbit   Q/E: roll   1-6: axis views   L: level   F: behind aim   T: next target   Wheel: zoom   Arrows / pad: spin   R: restart"
 	hint.modulate = Color(1, 1, 1, 0.65)
 
 func _on_spin_changed(v: Vector2) -> void:
@@ -596,9 +611,50 @@ func shot_basis(d: Vector3) -> Basis:
 	return Basis(right, up, -d)
 
 func snap_view() -> void:
-	var o := (-aim_dir + Vector3.UP * 0.4).normalized()
-	view_yaw = atan2(o.x, o.z)
-	view_pitch = asin(clampf(o.y, -0.99, 0.99))
+	# Turn the camera to look along the aim line from behind, keeping its current roll.
+	var b := Basis(view_q)
+	var f := -b.z
+	var q: Quaternion
+	if f.dot(aim_dir) < -0.9999:
+		q = Quaternion(b.y.normalized(), PI)
+	else:
+		q = Quaternion(f, aim_dir)
+	var nb := Basis(q) * b
+	# lift the camera a little in its own frame so the shot line is not seen end-on
+	nb = Basis(nb.x.normalized(), -0.35) * nb
+	view_q = Quaternion(nb.orthonormalized()).normalized()
+
+func orbit_view(dx: float, dy: float) -> void:
+	# trackball: rotate about the camera's own up and right axes, so there are no poles
+	var b := Basis(view_q)
+	var r := Basis(b.y.normalized(), -dx * 0.005) * Basis(b.x.normalized(), -dy * 0.005)
+	view_q = Quaternion((r * b).orthonormalized()).normalized()
+
+func roll_view(angle: float) -> void:
+	var b := Basis(view_q)
+	view_q = Quaternion((Basis(b.z.normalized(), angle) * b).orthonormalized()).normalized()
+
+func level_view() -> void:
+	# put the world's +Y back on top of the screen (keeps the current look direction)
+	var f := -Basis(view_q).z
+	if absf(f.dot(Vector3.UP)) > 0.999: return
+	var right := f.cross(Vector3.UP).normalized()
+	var up := right.cross(f).normalized()
+	view_q = Quaternion(Basis(right, up, -f))
+
+func snap_axis(a: Vector3) -> void:
+	# view from the +a side; of the 4 axis-aligned "up" choices, use the one closest to the current up
+	var cur_up := Basis(view_q).y
+	var axes: Array[Vector3] = [Vector3.RIGHT, Vector3.LEFT, Vector3.UP, Vector3.DOWN, Vector3.BACK, Vector3.FORWARD]
+	var best := Vector3.UP
+	var best_d := -2.0
+	for c in axes:
+		if absf(c.dot(a)) > 0.5: continue
+		var dd := c.dot(cur_up)
+		if dd > best_d:
+			best_d = dd
+			best = c
+	view_q = Quaternion(Basis(best.cross(a), best, a))
 
 func target_nearest(next: bool) -> void:
 	var cands: Array[Ball] = []
@@ -645,6 +701,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			match k.keycode:
 				KEY_R: new_game()
 				KEY_C: spin = Vector2.ZERO
+				KEY_L: level_view()
+				KEY_1, KEY_KP_1: snap_axis(Vector3.RIGHT)
+				KEY_2, KEY_KP_2: snap_axis(Vector3.LEFT)
+				KEY_3, KEY_KP_3: snap_axis(Vector3.UP)
+				KEY_4, KEY_KP_4: snap_axis(Vector3.DOWN)
+				KEY_5, KEY_KP_5: snap_axis(Vector3.BACK)
+				KEY_6, KEY_KP_6: snap_axis(Vector3.FORWARD)
 				KEY_F:
 					if state == State.AIMING:
 						snap_view()
@@ -682,13 +745,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			MOUSE_BUTTON_WHEEL_UP:
 				if mb.pressed:
 					if state == State.PLACING:
-						place_y = clampf(place_y + 0.03, LO.y, HI.y)
+						place_depth = clampf(place_depth - 0.05, 0.3, 6.0)
 					else:
 						zoom = clampf(zoom * 0.92, 0.35, 2.5)
 			MOUSE_BUTTON_WHEEL_DOWN:
 				if mb.pressed:
 					if state == State.PLACING:
-						place_y = clampf(place_y - 0.03, LO.y, HI.y)
+						place_depth = clampf(place_depth + 0.05, 0.3, 6.0)
 					else:
 						zoom = clampf(zoom / 0.92, 0.35, 2.5)
 	elif event is InputEventMouseMotion:
@@ -698,11 +761,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		var right_down := (mm.button_mask & MOUSE_BUTTON_MASK_RIGHT) != 0
 		var orbit := (mm.button_mask & MOUSE_BUTTON_MASK_MIDDLE) != 0 or (right_down and Input.is_key_pressed(KEY_CTRL))
 		if orbit:
-			view_yaw -= mm.relative.x * 0.005
-			view_pitch = clampf(view_pitch + mm.relative.y * 0.005, -1.45, 1.45)
+			orbit_view(mm.relative.x, mm.relative.y)
 		elif right_down and state == State.AIMING:
-			var s := 0.2 if Input.is_key_pressed(KEY_SHIFT) else 1.0
-			rotate_aim(-mm.relative.x * 0.003 * s, -mm.relative.y * 0.003 * s)
+			var sc := 0.2 if Input.is_key_pressed(KEY_SHIFT) else 1.0
+			rotate_aim(-mm.relative.x * 0.003 * sc, -mm.relative.y * 0.003 * sc)
 
 func confirm_placement() -> void:
 	if placement_valid(cue.pos):
@@ -893,18 +955,15 @@ func end_shot() -> void:
 	if foul:
 		player = other
 		state = State.PLACING
-		place_y = clampf(cue.pos.y, LO.y, HI.y)
-		view_yaw = 0.0
-		view_pitch = 0.45
+		place_depth = 2.6 * zoom
 		if cue.potted:
 			cue.potted = false
 			if cue.tween:
 				cue.tween.kill()
 			cue.node.show()
-			place_y = 0.0
 		cue.vel = Vector3.ZERO
 		cue.w = Vector3.ZERO
-		message = "Foul (%s). Player %d has ball in hand: move the mouse, wheel = height, click to place." % [reason, player + 1]
+		message = "Foul (%s). Player %d has ball in hand: move the mouse, wheel = depth, click to place." % [reason, player + 1]
 	else:
 		if potted_own:
 			message = "Nice shot! Player %d shoots again." % (player + 1)
@@ -918,7 +977,14 @@ func end_shot() -> void:
 # ================================================================ per-frame
 func _process(delta: float) -> void:
 	if state == State.MENU:
-		view_yaw += delta * 0.12   # slow cinematic orbit behind the menu
+		orbit_view(24.0 * delta, 0.0)   # slow cinematic orbit behind the menu
+	else:
+		var roll := 0.0
+		if Input.is_key_pressed(KEY_Q): roll -= 1.0
+		if Input.is_key_pressed(KEY_E): roll += 1.0
+		if roll != 0.0:
+			roll_view(roll * delta * 1.2)
+
 	if state == State.AIMING:
 		var slow := 0.25 if Input.is_key_pressed(KEY_SHIFT) else 1.0
 		var yaw := 0.0
@@ -938,16 +1004,17 @@ func _process(delta: float) -> void:
 			spin = (spin + sv * delta * 1.2).limit_length(1.0)
 
 	if state == State.PLACING:
+		# the cue ball follows the mouse on a plane facing the camera; the wheel moves that plane in depth
 		var mp := get_viewport().get_mouse_position()
 		var o := cam.project_ray_origin(mp)
 		var n := cam.project_ray_normal(mp)
-		if absf(n.y) > 0.05:
-			var t := (place_y - o.y) / n.y
-			if t > 0.0:
-				cue.pos = (o + n * t).clamp(LO, HI)
+		var denom := n.dot(-cam.global_transform.basis.z)
+		if denom > 0.05:
+			cue.pos = (o + n * (place_depth / denom)).clamp(LO, HI)
 
 	sync_balls(delta)
 	update_camera(delta)
+	update_gizmo()
 	update_aim()
 	update_hud()
 
@@ -971,11 +1038,9 @@ func update_camera(delta: float) -> void:
 	var k := 1.0 - exp(-8.0 * delta)
 	cam_target = cam_target.lerp(d_target, k)
 	cam_dist = lerpf(cam_dist, d_dist, k)
-	cam_pitch = lerpf(cam_pitch, view_pitch, k)
-	cam_yaw = lerp_angle(cam_yaw, view_yaw, k)
-	var off := Vector3(sin(cam_yaw) * cos(cam_pitch), sin(cam_pitch), cos(cam_yaw) * cos(cam_pitch)) * cam_dist
-	cam.position = cam_target + off
-	cam.look_at(cam_target, Vector3.UP)
+	cam_q = cam_q.slerp(view_q, k).normalized()
+	var b := Basis(cam_q)
+	cam.global_transform = Transform3D(b, cam_target + b.z * cam_dist)
 
 func place_line(node: MeshInstance3D, a: Vector3, b: Vector3, w: float) -> void:
 	var d := b - a
@@ -991,10 +1056,10 @@ func update_aim() -> void:
 	aim_root.visible = state == State.AIMING
 	invalid_marker.visible = state == State.PLACING and not placement_valid(cue.pos)
 	invalid_marker.position = cue.pos
-	drop_line.visible = state == State.PLACING
-	if state == State.PLACING:
-		place_line(drop_line, cue.pos, Vector3(cue.pos.x, -HALF.y, cue.pos.z), 0.003)
-	if state != State.AIMING: return
+	update_guides(guides_cue, cue.pos, state == State.AIMING or state == State.PLACING)
+	if state != State.AIMING:
+		update_guides(guides_ghost, Vector3.ZERO, false)
+		return
 
 	var d := aim_dir
 	var info := aim_trace(cue.pos, d)
@@ -1003,6 +1068,7 @@ func update_aim() -> void:
 	var end := cue.pos + d * t
 	place_line(aim_line, cue.pos, end, 0.004)
 	ghost.position = end
+	update_guides(guides_ghost, end, true)
 	target_hl.visible = hit != null
 	if hit != null:
 		target_hl.position = hit.pos
@@ -1103,7 +1169,6 @@ func build_menu() -> void:
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
 	menu_layer.add_child(center)
 
-	# main menu
 	menu_box = VBoxContainer.new()
 	menu_box.add_theme_constant_override("separation", 14)
 	center.add_child(menu_box)
@@ -1118,7 +1183,6 @@ func build_menu() -> void:
 	menu_button("How to play", menu_box, _on_help)
 	menu_button("Quit", menu_box, _on_quit)
 
-	# how-to-play page
 	help_box = VBoxContainer.new()
 	help_box.add_theme_constant_override("separation", 16)
 	help_box.visible = false
@@ -1146,7 +1210,6 @@ func open_menu() -> void:
 	charging = false
 	power = 0.0
 	zoom = 1.0
-	view_pitch = 0.3
 	resume_btn.visible = game_started
 	menu_box.visible = true
 	help_box.visible = false
@@ -1176,3 +1239,92 @@ func _on_help_back() -> void:
 
 func _on_quit() -> void:
 	get_tree().quit()
+
+
+# ================================================================ orientation gizmo
+func build_gizmo() -> void:
+	# A small cube in the corner that mirrors the camera orientation. Click a face to snap to that view.
+	gizmo_box = SubViewportContainer.new()
+	gizmo_box.stretch = true
+	gizmo_box.position = Vector2(20, 140)
+	gizmo_box.custom_minimum_size = Vector2(140, 140)
+	gizmo_box.size = Vector2(140, 140)
+	gizmo_box.gui_input.connect(_on_gizmo_input)
+	hud.add_child(gizmo_box)
+
+	var vp := SubViewport.new()
+	vp.own_world_3d = true
+	vp.transparent_bg = true
+	vp.msaa_3d = Viewport.MSAA_4X
+	gizmo_box.add_child(vp)
+
+	gizmo_cam = Camera3D.new()
+	gizmo_cam.projection = Camera3D.PROJECTION_ORTHOGONAL
+	gizmo_cam.size = 2.3
+	gizmo_cam.near = 0.1
+	gizmo_cam.far = 20.0
+	vp.add_child(gizmo_cam)
+
+	var axes: Array[Vector3] = [Vector3.RIGHT, Vector3.LEFT, Vector3.UP, Vector3.DOWN, Vector3.BACK, Vector3.FORWARD]
+	var names: Array[String] = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"]
+	var cols: Array[Color] = [
+		Color(0.95, 0.3, 0.3), Color(0.55, 0.15, 0.15),
+		Color(0.35, 0.85, 0.4), Color(0.15, 0.45, 0.2),
+		Color(0.35, 0.55, 1.0), Color(0.18, 0.28, 0.6)]
+	for i in 6:
+		var a := axes[i]
+		var up_hint := Vector3.UP
+		if absf(a.y) > 0.5:
+			up_hint = Vector3.FORWARD if a.y > 0.0 else Vector3.BACK
+		var fb := Basis(up_hint.cross(a), up_hint, a)
+		var qm := QuadMesh.new()
+		qm.size = Vector2(1.2, 1.2)
+		qm.material = unshaded(cols[i])
+		var face := MeshInstance3D.new()
+		face.mesh = qm
+		face.transform = Transform3D(fb, a * 0.6)
+		vp.add_child(face)
+		var lab := Label3D.new()
+		lab.text = names[i]
+		lab.font_size = 96
+		lab.pixel_size = 0.0045
+		lab.outline_size = 14
+		lab.shaded = false
+		lab.double_sided = false
+		lab.transform = Transform3D(fb, a * 0.61)
+		vp.add_child(lab)
+
+	var cap := make_label(12, Vector2(20, 284))
+	cap.text = "Click a face or press 1-6"
+
+func update_gizmo() -> void:
+	if gizmo_cam == null: return
+	var b := Basis(cam_q)
+	gizmo_cam.global_transform = Transform3D(b, b.z * 5.0)
+
+func _on_gizmo_input(event: InputEvent) -> void:
+	if not (event is InputEventMouseButton): return
+	var mb := event as InputEventMouseButton
+	if mb.button_index != MOUSE_BUTTON_LEFT or not mb.pressed: return
+	var o := gizmo_cam.project_ray_origin(mb.position)
+	var n := gizmo_cam.project_ray_normal(mb.position)
+	# ray vs the gizmo cube (half size 0.6)
+	var tmin := -INF
+	var tmax := INF
+	for ax in 3:
+		if absf(n[ax]) < 1e-6: continue
+		var t1 := (-0.6 - o[ax]) / n[ax]
+		var t2 := (0.6 - o[ax]) / n[ax]
+		tmin = maxf(tmin, minf(t1, t2))
+		tmax = minf(tmax, maxf(t1, t2))
+	if tmax < tmin: return
+	var hit := o + n * tmin
+	var best := 0
+	var bv := 0.0
+	for ax in 3:
+		if absf(hit[ax]) > bv:
+			bv = absf(hit[ax])
+			best = ax
+	var a := Vector3.ZERO
+	a[best] = signf(hit[best])
+	snap_axis(a)
