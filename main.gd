@@ -46,25 +46,6 @@ const DIGITS := ["111101101101111", "010110010010111", "111001111100111", "11100
 	"101101111001001", "111100111001111", "111100111101111", "111001001001001",
 	"111101111101111", "111101111001111"]
 
-const HELP_TEXT := """GOAL
-Pot all the balls of your group, then the black ball (35). Solids are 1-17, stripes are 18-34. The first ball you pot sets your group. There are 12 pockets: the 8 corners and the middles of the 4 long edges.
-
-SHOOTING
-Hold the left mouse button and drag DOWN to pull the cue back, release to shoot (Esc cancels).
-Right-drag or A / D / W / S to aim (hold Shift for fine aim).
-T aims at the nearest ball, press again for the next one.
-Arrow keys or the ball pad choose where the cue tip hits the ball (spin). Spin curves the shot, and C re-centers it.
-
-CAMERA (a free trackball: there is no fixed "up")
-Ctrl + right-drag or middle-drag to orbit over any pole, Q / E to roll, mouse wheel to zoom.
-Keys 1-6, or a click on the orientation cube, snap to the +X, -X, +Y, -Y, +Z and -Z views. The box edges are colored by axis: X red, Y green, Z blue.
-F looks along the aim line, L levels the horizon.
-
-FOULS
-A scratch, hitting no ball, or hitting the wrong group first gives your opponent ball in hand: move the mouse, use the wheel to change depth, click to place.
-
-M or Esc opens this menu, R restarts the game."""
-
 enum State { MENU, PLACING, AIMING, MOVING, GAME_OVER }
 
 class Ball:
@@ -79,68 +60,6 @@ class Ball:
 	func _init(n: int, p: Vector3) -> void:
 		num = n
 		pos = p
-
-## HUD control that draws the potted balls.
-class Tray extends Control:
-	var nums: Array[int] = []
-	var colors: Array = []
-	func _draw() -> void:
-		for i in nums.size():
-			_ball(Vector2(12 + i * 26, 14), nums[i], 10.0)
-	func _ball(p: Vector2, num: int, rad: float) -> void:
-		var cream := Color(0.96, 0.96, 0.92)
-		var col: Color = colors[num]
-		if num < 18 or num == 35:
-			draw_circle(p, rad, col)
-		else:
-			draw_circle(p, rad, cream)
-			var a := asin(0.55)
-			var pts := PackedVector2Array()
-			for k in 9:
-				var ang := lerpf(-a, a, k / 8.0)
-				pts.append(p + Vector2(cos(ang), sin(ang)) * rad)
-			for k in 9:
-				var ang := lerpf(PI - a, PI + a, k / 8.0)
-				pts.append(p + Vector2(cos(ang), sin(ang)) * rad)
-			draw_colored_polygon(pts, col)
-		draw_circle(p, rad * 0.55, cream)
-		draw_string(ThemeDB.fallback_font, p + Vector2(-rad, rad * 0.3), str(num),
-			HORIZONTAL_ALIGNMENT_CENTER, rad * 2.0, int(rad * 0.8), Color.BLACK)
-
-## Cue-ball face: click / drag to choose the strike point. x = right, y = top.
-class SpinPad extends Control:
-	signal changed(v: Vector2)
-	var offset := Vector2.ZERO
-	func _gui_input(event: InputEvent) -> void:
-		if event is InputEventMouseButton:
-			var mb := event as InputEventMouseButton
-			if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed:
-				if mb.double_click:
-					changed.emit(Vector2.ZERO)
-				else:
-					_set_from(mb.position)
-		elif event is InputEventMouseMotion:
-			var mm := event as InputEventMouseMotion
-			if (mm.button_mask & MOUSE_BUTTON_MASK_LEFT) != 0:
-				_set_from(mm.position)
-	func _set_from(p: Vector2) -> void:
-		var c := size * 0.5
-		var r := minf(size.x, size.y) * 0.5 - 6.0
-		var v := Vector2((p.x - c.x) / r, -(p.y - c.y) / r)
-		if v.length() > 1.0:
-			v = v.normalized()
-		changed.emit(v)
-	func _draw() -> void:
-		var c := size * 0.5
-		var r := minf(size.x, size.y) * 0.5 - 6.0
-		draw_circle(c, r + 5.0, Color(0, 0, 0, 0.55))
-		draw_circle(c, r, Color(0.96, 0.96, 0.92))
-		draw_line(c + Vector2(-r, 0), c + Vector2(r, 0), Color(0, 0, 0, 0.25), 1.0)
-		draw_line(c + Vector2(0, -r), c + Vector2(0, r), Color(0, 0, 0, 0.25), 1.0)
-		draw_arc(c, r, 0.0, TAU, 48, Color.BLACK, 2.0)
-		var dot := c + Vector2(offset.x, -offset.y) * r
-		draw_circle(dot, 7.0, Color(0.85, 0.1, 0.1))
-		draw_arc(dot, 7.0, 0.0, TAU, 20, Color.WHITE, 1.5)
 
 var ball_colors: Array[Color] = []
 
@@ -187,20 +106,7 @@ var guides_cue: Array[MeshInstance3D] = []
 var guides_ghost: Array[MeshInstance3D] = []
 var gizmo_box: SubViewportContainer
 var gizmo_cam: Camera3D
-var hud: CanvasLayer
-var status_label: Label
-var msg_label: Label
-var over_label: Label
-var power_bar: ProgressBar
-var tray: Tray
-var spin_pad: SpinPad
-var spin_label: Label
-
-# ---- menu
-var menu_layer: CanvasLayer
-var menu_box: VBoxContainer
-var help_box: VBoxContainer
-var resume_btn: Button
+var game_ui: GameUI
 var game_started := false
 var state_before_menu := State.AIMING
 
@@ -219,9 +125,14 @@ func _ready() -> void:
 	build_environment()
 	build_volume()
 	build_aim_nodes()
-	build_hud()
+	game_ui = GameUI.new()
+	game_ui.ball_colors = ball_colors
+	add_child(game_ui)
+	game_ui.spin_changed.connect(_on_spin_changed)
+	game_ui.play_requested.connect(_on_play)
+	game_ui.resume_requested.connect(_on_resume)
+	game_ui.quit_requested.connect(_on_quit)
 	build_gizmo()
-	build_menu()
 	cam = Camera3D.new()
 	cam.fov = 55.0
 	cam.near = 0.02
@@ -412,56 +323,6 @@ func update_guides(lines: Array[MeshInstance3D], p: Vector3, show_them: bool) ->
 		var wall := p
 		wall[ax] = HALF[ax] if p[ax] >= 0.0 else -HALF[ax]
 		place_line(lines[ax], p, wall, 0.0025)
-
-func make_label(text_size: int, pos: Vector2, width := 0.0) -> Label:
-	var l := Label.new()
-	l.position = pos
-	l.add_theme_font_size_override("font_size", text_size)
-	l.add_theme_color_override("font_color", Color.WHITE)
-	l.add_theme_color_override("font_outline_color", Color.BLACK)
-	l.add_theme_constant_override("outline_size", 6)
-	if width > 0.0:
-		l.custom_minimum_size = Vector2(width, 0)
-		l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	hud.add_child(l)
-	return l
-
-func build_hud() -> void:
-	hud = CanvasLayer.new()
-	add_child(hud)
-	status_label = make_label(26, Vector2(24, 14))
-	msg_label = make_label(16, Vector2(24, 52), 900.0)
-	msg_label.add_theme_color_override("font_color", Color(1, 0.95, 0.6))
-	var pl := make_label(14, Vector2(1000, 8))
-	pl.text = "Power (hold LMB, drag down)"
-	power_bar = ProgressBar.new()
-	power_bar.position = Vector2(1000, 32)
-	power_bar.custom_minimum_size = Vector2(250, 20)
-	power_bar.min_value = 0.0
-	power_bar.max_value = 1.0
-	power_bar.show_percentage = false
-	hud.add_child(power_bar)
-	over_label = make_label(56, Vector2(0, 280), 1280.0)
-	over_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	over_label.visible = false
-	tray = Tray.new()
-	tray.position = Vector2(24, 622)
-	tray.colors = ball_colors
-	tray.nums = potted_tray
-	hud.add_child(tray)
-
-	spin_label = make_label(14, Vector2(1112, 528))
-	spin_label.text = "Cue tip (C = center)"
-	spin_pad = SpinPad.new()
-	spin_pad.position = Vector2(1140, 556)
-	spin_pad.custom_minimum_size = Vector2(112, 112)
-	spin_pad.size = Vector2(112, 112)
-	spin_pad.changed.connect(_on_spin_changed)
-	hud.add_child(spin_pad)
-
-	var hint := make_label(13, Vector2(24, 662), 1080.0)
-	hint.text = "LMB hold + drag down: power, release to shoot (Esc cancels)   Right-drag / A,D,W,S: aim   Ctrl+Right-drag / MMB: orbit   Q/E: roll   1-6: axis views   L: level   F: behind aim   T: next target   Wheel: zoom   Arrows / pad: spin   R: restart"
-	hint.modulate = Color(1, 1, 1, 0.65)
 
 func _on_spin_changed(v: Vector2) -> void:
 	spin = v
@@ -684,13 +545,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			if mk.pressed and not mk.echo:
 				match mk.keycode:
 					KEY_ENTER, KEY_KP_ENTER, KEY_SPACE:
-						if not help_box.visible:
+						if not game_ui.help_visible:
 							if game_started:
 								_on_resume()
 							else:
 								_on_play()
 					KEY_ESCAPE:
-						if help_box.visible:
+						if game_ui.help_visible:
 							_on_help_back()
 						elif game_started:
 							_on_resume()
@@ -1114,94 +975,14 @@ func aim_trace(origin: Vector3, dir: Vector3) -> Dictionary:
 	return {"t": best, "ball": hit}
 
 func update_hud() -> void:
-	hud.visible = state != State.MENU
 	var grp := "open table"
 	if groups[player] == 0: grp = "solids 1-17"
 	elif groups[player] == 1: grp = "stripes 18-34"
 	if groups[player] != -1 and remaining(groups[player]) == 0: grp = "black ball"
-	status_label.text = "Player %d  (%s)" % [player + 1, grp]
-	msg_label.text = message
-	power_bar.value = power
-	over_label.visible = state == State.GAME_OVER
-	if state == State.GAME_OVER:
-		over_label.text = "Player %d wins!" % (winner + 1)
-	spin_pad.visible = state == State.AIMING
-	spin_label.visible = state == State.AIMING
-	spin_pad.offset = spin
-	spin_pad.queue_redraw()
-	tray.queue_redraw()
+	var game_over_text := "Player %d wins!" % (winner + 1) if state == State.GAME_OVER else ""
+	game_ui.update_hud("Player %d  (%s)" % [player + 1, grp], message, power,
+		game_over_text, state == State.AIMING, spin, potted_tray, state != State.MENU)
 
-
-# ================================================================ menu
-func menu_label(text: String, size: int, color: Color, parent: Control) -> Label:
-	var l := Label.new()
-	l.text = text
-	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	l.add_theme_font_size_override("font_size", size)
-	l.add_theme_color_override("font_color", color)
-	l.add_theme_color_override("font_outline_color", Color.BLACK)
-	l.add_theme_constant_override("outline_size", 10)
-	parent.add_child(l)
-	return l
-
-func menu_button(text: String, parent: Control, cb: Callable) -> Button:
-	var b := Button.new()
-	b.text = text
-	b.custom_minimum_size = Vector2(320, 54)
-	b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	b.focus_mode = Control.FOCUS_NONE
-	b.add_theme_font_size_override("font_size", 24)
-	b.pressed.connect(cb)
-	parent.add_child(b)
-	return b
-
-func build_menu() -> void:
-	menu_layer = CanvasLayer.new()
-	menu_layer.layer = 10
-	add_child(menu_layer)
-
-	var dim := ColorRect.new()
-	dim.color = Color(0.02, 0.03, 0.07, 0.5)
-	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
-	menu_layer.add_child(dim)
-
-	var center := CenterContainer.new()
-	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	menu_layer.add_child(center)
-
-	menu_box = VBoxContainer.new()
-	menu_box.add_theme_constant_override("separation", 14)
-	center.add_child(menu_box)
-	menu_label("ZERO-G POOL", 84, Color(0.75, 0.92, 1.0), menu_box)
-	menu_label("36 balls  -  12 pockets  -  no gravity", 20, Color(1, 0.95, 0.65), menu_box)
-	var gap := Control.new()
-	gap.custom_minimum_size = Vector2(0, 28)
-	menu_box.add_child(gap)
-	menu_button("Play", menu_box, _on_play)
-	resume_btn = menu_button("Resume game", menu_box, _on_resume)
-	resume_btn.visible = false
-	menu_button("How to play", menu_box, _on_help)
-	menu_button("Quit", menu_box, _on_quit)
-
-	help_box = VBoxContainer.new()
-	help_box.add_theme_constant_override("separation", 16)
-	help_box.visible = false
-	center.add_child(help_box)
-	menu_label("HOW TO PLAY", 48, Color(0.75, 0.92, 1.0), help_box)
-	var panel := PanelContainer.new()
-	help_box.add_child(panel)
-	var margin := MarginContainer.new()
-	var sides: Array[String] = ["left", "right", "top", "bottom"]
-	for side in sides:
-		margin.add_theme_constant_override("margin_" + side, 22)
-	panel.add_child(margin)
-	var txt := Label.new()
-	txt.text = HELP_TEXT
-	txt.custom_minimum_size = Vector2(860, 0)
-	txt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	txt.add_theme_font_size_override("font_size", 17)
-	margin.add_child(txt)
-	menu_button("Back", help_box, _on_help_back)
 
 func open_menu() -> void:
 	if state == State.MENU: return
@@ -1210,32 +991,24 @@ func open_menu() -> void:
 	charging = false
 	power = 0.0
 	zoom = 1.0
-	resume_btn.visible = game_started
-	menu_box.visible = true
-	help_box.visible = false
-	menu_layer.visible = true
+	game_ui.open_menu(game_started)
 
 func _on_play() -> void:
 	if game_started:
 		new_game()
 	game_started = true
-	menu_layer.visible = false
+	game_ui.hide_menu()
 	state = State.AIMING
 	snap_view()
 
 func _on_resume() -> void:
-	menu_layer.visible = false
+	game_ui.hide_menu()
 	state = state_before_menu
 	if state == State.AIMING:
 		snap_view()
 
-func _on_help() -> void:
-	menu_box.visible = false
-	help_box.visible = true
-
 func _on_help_back() -> void:
-	help_box.visible = false
-	menu_box.visible = true
+	game_ui.show_menu_options()
 
 func _on_quit() -> void:
 	get_tree().quit()
@@ -1250,7 +1023,7 @@ func build_gizmo() -> void:
 	gizmo_box.custom_minimum_size = Vector2(140, 140)
 	gizmo_box.size = Vector2(140, 140)
 	gizmo_box.gui_input.connect(_on_gizmo_input)
-	hud.add_child(gizmo_box)
+	game_ui.hud_layer.add_child(gizmo_box)
 
 	var vp := SubViewport.new()
 	vp.own_world_3d = true
@@ -1294,7 +1067,7 @@ func build_gizmo() -> void:
 		lab.transform = Transform3D(fb, a * 0.61)
 		vp.add_child(lab)
 
-	var cap := make_label(12, Vector2(20, 284))
+	var cap := game_ui.make_label(12, Vector2(20, 284))
 	cap.text = "Click a face or press 1-6"
 
 func update_gizmo() -> void:
